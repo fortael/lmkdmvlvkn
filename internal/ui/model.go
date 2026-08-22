@@ -23,7 +23,7 @@ type tab int
 const (
 	tabSystemData tab = iota
 	tabDocker
-	tabFolders
+	tabHome
 	tabApplications
 	tabCount
 )
@@ -34,13 +34,21 @@ func (t tab) String() string {
 		return "System Data"
 	case tabDocker:
 		return "Docker"
-	case tabFolders:
-		return "Folders"
+	case tabHome:
+		return "Home"
 	case tabApplications:
 		return "Applications"
 	default:
 		return "?"
 	}
+}
+
+// browsable reports whether a tab shows the folder table (and therefore
+// supports selection, cleaning and drilling in) rather than a placeholder.
+// Docker is handled by a dedicated implementation and stays a placeholder
+// until that lands.
+func (t tab) browsable() bool {
+	return t == tabSystemData || t == tabHome || t == tabApplications
 }
 
 type mode int
@@ -65,18 +73,34 @@ const (
 	sortBySafe
 )
 
-// navFrame is one level of the directory browser within System Data.
-// nav[0] is always the scanned root (e.g. ~/Library/Caches); pressing
-// Enter on a directory entry pushes a new frame for its contents, and
-// Esc/Backspace pops back up — like a minimal file manager.
+// navFrame is one level of the directory browser. Each browsable tab has
+// its own stack of these: nav[0] is the tab's landing listing, pressing
+// Enter on a directory pushes a frame for its contents, and Esc/Backspace
+// pops back up — like a minimal file manager.
+//
+// nav[0] is not always a real directory. The System Data tab merges five
+// separate Library folders into one listing, and the Home tab is a curated
+// list of individual paths rather than any single parent, so a frame with
+// an empty path is a synthetic listing assembled from elsewhere.
 type navFrame struct {
-	label    string // breadcrumb label (folder name, or root's short name)
-	path     string
-	source   string // TYPE column label, inherited from the root
+	// id distinguishes frames for message routing. Listings arrive
+	// asynchronously and the aggregate frame receives several, so matching
+	// on path alone would be ambiguous (the aggregate has no path of its
+	// own, and the same folder can be open at two depths).
+	id    int
+	label string // breadcrumb label (folder name, or the landing listing's name)
+	path  string // "" for a synthetic listing
+	root  knowledge.Root
+	// source is the TYPE column label inherited by child frames. The
+	// aggregate frame leaves it empty since its rows carry their own.
+	source   string
 	entries  []*scan.Entry
 	selected string
 	loading  bool
-	loadErr  string // scoped to this frame, so an error in a subdirectory
+	// pending counts listings still in flight for a synthetic frame that
+	// merges several sources; loading clears when it reaches zero.
+	pending int
+	loadErr string // scoped to this frame, so an error in a subdirectory
 	// doesn't linger on screen after navigating back up to one that
 	// loaded fine
 }
@@ -125,11 +149,27 @@ type Model struct {
 	activeTab tab
 	mode      mode
 
-	nav          []navFrame
+	// navs holds one independent browser stack per tab, so switching tabs
+	// preserves how deep the user had navigated in each.
+	navs        [tabCount][]navFrame
+	nextFrameID int
+
 	detailScroll int
 
 	sortCol sortColumn
 	sortAsc bool
+
+	// homeDB maps a Home-tab item's absolute path to its dictionary entry.
+	// The Home tab is curated by path rather than discovered by name, so
+	// its lookups can't go through the name-keyed dictionary the other
+	// tabs use.
+	homeDB map[string]knowledge.Entry
+
+	// appIndex backs orphan detection. It shells out to `defaults read`
+	// once per installed app, so it's built in the background and is
+	// empty (and therefore answers "not an orphan" to everything) until
+	// that finishes.
+	appIndex knowledge.AppIndex
 
 	// reclaimCache holds, per folder path, how much a granular (CleanPaths)
 	// clean action would actually free — computed lazily in the background
@@ -149,23 +189,99 @@ type Model struct {
 	confirmNativeLabel string
 }
 
-// New builds the model rooted at ~/Library/Caches.
+// New builds the model with a landing frame for each browsable tab.
 func New() Model {
-	home, _ := os.UserHomeDir()
-	root := filepath.Join(home, "Library", "Caches")
-	return Model{
-		nav: []navFrame{{
-			label:   "Caches",
-			path:    root,
-			source:  "Cache",
-			loading: true,
-		}},
-		scanner: scan.NewScanner(2),
+	m := Model{
+		scanner:      scan.NewScanner(2),
+		reclaimCache: make(map[string]reclaimInfo),
+		homeDB:       make(map[string]knowledge.Entry),
 	}
+
+	m.navs[tabSystemData] = []navFrame{{
+		id:      m.newFrameID(),
+		label:   "System Data",
+		root:    knowledge.RootCaches,
+		loading: true,
+		pending: len(knowledge.SystemDataRoots()),
+	}}
+
+	m.navs[tabApplications] = []navFrame{{
+		id:      m.newFrameID(),
+		label:   "Applications",
+		root:    knowledge.RootApplications,
+		source:  "App",
+		loading: true,
+		pending: 1,
+	}}
+
+	m.navs[tabHome] = []navFrame{m.buildHomeFrame()}
+
+	return m
+}
+
+func (m *Model) newFrameID() int {
+	m.nextFrameID++
+	return m.nextFrameID
+}
+
+// buildHomeFrame turns the curated Home list into a ready-to-display
+// frame. Unlike the other tabs there is nothing to list: the paths are
+// known up front, so the frame starts populated and only the sizes are
+// left to compute in the background.
+func (m *Model) buildHomeFrame() navFrame {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return navFrame{id: m.newFrameID(), label: "Home", root: knowledge.RootHome, loadErr: err.Error()}
+	}
+	items := knowledge.HomeItems()
+	entries := make([]*scan.Entry, 0, len(items))
+	for _, it := range items {
+		path := filepath.Join(home, it.RelPath)
+		name := it.Display
+		if name == "" {
+			name = "~/" + it.RelPath
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		m.homeDB[path] = it.Entry
+		entries = append(entries, &scan.Entry{
+			Name:    name,
+			Path:    path,
+			Source:  "Home",
+			Root:    string(knowledge.RootHome),
+			ModTime: info.ModTime(),
+			IsDir:   info.IsDir(),
+			Size:    -1,
+		})
+	}
+	f := navFrame{
+		id:      m.newFrameID(),
+		label:   "Home",
+		root:    knowledge.RootHome,
+		source:  "Home",
+		entries: entries,
+	}
+	if len(entries) > 0 {
+		f.selected = entries[0].Path
+	}
+	return f
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadDirCmd(m.nav[0].path, m.nav[0].source), waitForSizeCmd(m.scanner.Results))
+	cmds := []tea.Cmd{waitForSizeCmd(m.scanner.Results), indexAppsCmd()}
+
+	sysID := m.navs[tabSystemData][0].id
+	for _, r := range knowledge.SystemDataRoots() {
+		cmds = append(cmds, loadDirCmd(sysID, r.Path, r.Label, string(r.Root)))
+	}
+	cmds = append(cmds, loadAppsCmd(m.navs[tabApplications][0].id))
+
+	for _, e := range m.navs[tabHome][0].entries {
+		m.scanner.Enqueue(e.Path)
+	}
+	return tea.Batch(cmds...)
 }
 
 type spinnerTickMsg struct{}
@@ -181,15 +297,33 @@ func spinnerTickCmd() tea.Cmd {
 }
 
 type entriesLoadedMsg struct {
-	path    string
+	frameID int
 	entries []*scan.Entry
 	err     error
 }
 
-func loadDirCmd(path, source string) tea.Cmd {
+func loadDirCmd(frameID int, path, source, root string) tea.Cmd {
 	return func() tea.Msg {
-		entries, err := scan.List(path, source)
-		return entriesLoadedMsg{path: path, entries: entries, err: err}
+		entries, err := scan.List(path, source, root)
+		return entriesLoadedMsg{frameID: frameID, entries: entries, err: err}
+	}
+}
+
+func loadAppsCmd(frameID int) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := scan.ListApplications(string(knowledge.RootApplications))
+		return entriesLoadedMsg{frameID: frameID, entries: entries, err: err}
+	}
+}
+
+type appIndexMsg knowledge.AppIndex
+
+// indexAppsCmd builds the installed-application index used to flag
+// leftover folders. It's a background command because it spawns a
+// short-lived process per installed app.
+func indexAppsCmd() tea.Cmd {
+	return func() tea.Msg {
+		return appIndexMsg(knowledge.IndexInstalledApps())
 	}
 }
 
@@ -245,8 +379,18 @@ func cleanDir(dir string, relPatterns []string) error {
 }
 
 // cleanAllChildren removes the contents of dir (not the directory itself),
-// so apps that expect the folder to already exist keep working.
+// so apps that expect the folder to already exist keep working. When the
+// target is a plain file rather than a directory — the Home tab lists a
+// few, such as a stray JVM heap dump — the file itself is what gets
+// removed, since "the contents of a file" is meaningless.
 func cleanAllChildren(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return os.Remove(dir)
+	}
 	items, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -298,7 +442,14 @@ type nativeCleanDoneMsg struct {
 func nativeCleanCmd(dir, command string) tea.Cmd {
 	return func() tea.Msg {
 		cmd := exec.Command("sh", "-c", command)
-		cmd.Dir = dir
+		// A native command's working directory only makes sense if it is
+		// one; entries whose target is a file (or has vanished) still run
+		// fine from the parent.
+		if info, err := os.Lstat(dir); err == nil && !info.IsDir() {
+			cmd.Dir = filepath.Dir(dir)
+		} else {
+			cmd.Dir = dir
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		out, err := cmd.CombinedOutput()
 		return nativeCleanDoneMsg{path: dir, err: err, summary: lastLine(string(out))}
@@ -360,7 +511,7 @@ func reclaimSizeCmd(basePath string, patterns []string) tea.Cmd {
 // doesn't need to be threaded through every selection-changing call site
 // individually (moveSelection, openSelected, goUp, clickSort, ...).
 func (m *Model) maybeComputeReclaim() tea.Cmd {
-	if m.activeTab != tabSystemData || m.mode != modeNormal {
+	if !m.activeTab.browsable() || m.mode != modeNormal {
 		return nil
 	}
 	e := m.selectedEntry()
@@ -414,6 +565,10 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		m.spinnerFrame++
 		return m, spinnerTickCmd()
 
+	case appIndexMsg:
+		m.appIndex = knowledge.AppIndex(msg)
+		return m, nil
+
 	case reclaimSizeMsg:
 		if m.reclaimCache == nil {
 			m.reclaimCache = make(map[string]reclaimInfo)
@@ -422,46 +577,56 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 
 	case entriesLoadedMsg:
-		for i := range m.nav {
-			if m.nav[i].path != msg.path {
-				continue
+		f := m.frameByID(msg.frameID)
+		if f == nil {
+			return m, nil
+		}
+		if f.pending > 0 {
+			f.pending--
+		}
+		if f.pending == 0 {
+			f.loading = false
+		}
+		if msg.err != nil {
+			// A synthetic frame merging several roots keeps whatever did
+			// load: one unreadable Library folder shouldn't blank the
+			// whole listing, so the error is only surfaced when nothing
+			// arrived at all.
+			if len(f.entries) == 0 && f.pending == 0 {
+				f.loadErr = msg.err.Error()
 			}
-			m.nav[i].loading = false
-			if msg.err != nil {
-				m.nav[i].loadErr = msg.err.Error()
-				break
-			}
-			m.nav[i].loadErr = ""
-			entries := msg.entries
-			sortEntries(entries, m.sortCol, m.sortAsc)
-			m.nav[i].entries = entries
-			if len(entries) > 0 {
-				m.nav[i].selected = entries[0].Path
-			}
-			for _, e := range entries {
-				m.scanner.Enqueue(e.Path)
-			}
-			break
+			return m, nil
+		}
+		f.loadErr = ""
+		f.entries = append(f.entries, msg.entries...)
+		m.sortFrame(f)
+		if f.selected == "" && len(f.entries) > 0 {
+			f.selected = f.entries[0].Path
+		}
+		for _, e := range msg.entries {
+			m.scanner.Enqueue(e.Path)
 		}
 		return m, nil
 
 	case sizeResultMsg:
-		for fi := range m.nav {
-			var touched bool
-			for _, e := range m.nav[fi].entries {
-				if e.Path == msg.Path {
-					e.Size = msg.Size
-					if !msg.ModTime.IsZero() {
-						e.ModTime = msg.ModTime
+		for ti := range m.navs {
+			for fi := range m.navs[ti] {
+				var touched bool
+				for _, e := range m.navs[ti][fi].entries {
+					if e.Path == msg.Path {
+						e.Size = msg.Size
+						if !msg.ModTime.IsZero() {
+							e.ModTime = msg.ModTime
+						}
+						e.SizeErr = msg.Err
+						e.SizeReady = true
+						touched = true
+						break
 					}
-					e.SizeErr = msg.Err
-					e.SizeReady = true
-					touched = true
-					break
 				}
-			}
-			if touched {
-				sortEntries(m.nav[fi].entries, m.sortCol, m.sortAsc)
+				if touched {
+					m.sortFrame(&m.navs[ti][fi])
+				}
 			}
 		}
 		return m, waitForSizeCmd(m.scanner.Results)
@@ -474,16 +639,7 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		} else {
 			m.statusMsg = "cleaned " + filepath.Base(msg.path)
 		}
-		delete(m.reclaimCache, msg.path)
-		for fi := range m.nav {
-			for _, e := range m.nav[fi].entries {
-				if e.Path == msg.path {
-					e.SizeReady = false
-					e.Size = -1
-				}
-			}
-		}
-		m.scanner.Enqueue(msg.path)
+		m.invalidateSize(msg.path)
 		return m, nil
 
 	case nativeCleanDoneMsg:
@@ -497,16 +653,7 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		default:
 			m.statusMsg = "native clean done"
 		}
-		delete(m.reclaimCache, msg.path)
-		for fi := range m.nav {
-			for _, e := range m.nav[fi].entries {
-				if e.Path == msg.path {
-					e.SizeReady = false
-					e.Size = -1
-				}
-			}
-		}
-		m.scanner.Enqueue(msg.path)
+		m.invalidateSize(msg.path)
 		return m, nil
 
 	case manualDeleteDoneMsg:
@@ -518,42 +665,77 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		m.statusMsg = "deleted " + filepath.Base(msg.path)
 		delete(m.reclaimCache, msg.path)
-		for fi := range m.nav {
-			m.nav[fi].removeEntry(msg.path)
+		for ti := range m.navs {
+			for fi := range m.navs[ti] {
+				m.navs[ti][fi].removeEntry(msg.path)
+			}
 		}
 		return m, nil
 	}
 	return m, nil
 }
 
+// invalidateSize marks path's cached size stale everywhere it appears and
+// requeues it for measurement, so the table reflects what a clean actually
+// freed instead of the pre-clean figure.
+func (m *Model) invalidateSize(path string) {
+	delete(m.reclaimCache, path)
+	for ti := range m.navs {
+		for fi := range m.navs[ti] {
+			for _, e := range m.navs[ti][fi].entries {
+				if e.Path == path {
+					e.SizeReady = false
+					e.Size = -1
+				}
+			}
+		}
+	}
+	m.scanner.Enqueue(path)
+}
+
+// frameByID finds a frame across every tab's stack. Listings are
+// asynchronous, so one can arrive for a tab the user isn't looking at, or
+// for a frame that has since been popped — in which case this returns nil
+// and the result is discarded.
+func (m *Model) frameByID(id int) *navFrame {
+	for ti := range m.navs {
+		for fi := range m.navs[ti] {
+			if m.navs[ti][fi].id == id {
+				return &m.navs[ti][fi]
+			}
+		}
+	}
+	return nil
+}
+
 func (m Model) View() string {
 	return m.render()
 }
 
-// sortEntries orders entries by col/asc. Score is computed with each
-// entry's own listing as sibling context, so JetBrains-style version
-// comparisons stay correct no matter which directory is being sorted.
+// sortFrame orders one frame's entries by the active sort column, scoring
+// each entry through the model so Home's path-keyed entries and orphan
+// annotations are accounted for the same way the table renders them.
+func (m Model) sortFrame(f *navFrame) {
+	scoreOf := make(map[*scan.Entry]knowledge.Score, len(f.entries))
+	for _, e := range f.entries {
+		scoreOf[e] = m.knowledgeIn(f.entries, e).Score
+	}
+	sortEntries(f.entries, m.sortCol, m.sortAsc, scoreOf)
+}
+
+// sortEntries orders entries by col/asc, using precomputed scores.
 //
 // "Unknown entries always trail, excluded from the sort" only applies when
 // sorting BY safety (sortBySafe): that's the one column where "not
 // reviewed yet" genuinely isn't a value worth ordering by. It deliberately
 // does NOT apply to name/size/mod — most subfolders (e.g. anything inside
 // an opened app cache) contain nothing but Unknown entries, since our
-// dictionary is keyed by top-level cache folder names; excluding them
-// there would make sorting by size effectively never do anything below
-// the top level. For the default composite sort, Unknown's zero score
-// already sorts last on its own as a numeric tie-break, so no special
-// case is needed there either.
-func sortEntries(entries []*scan.Entry, col sortColumn, asc bool) {
-	siblings := make([]string, len(entries))
-	for i, e := range entries {
-		siblings[i] = e.Name
-	}
-	scoreOf := make(map[*scan.Entry]knowledge.Score, len(entries))
-	for _, e := range entries {
-		scoreOf[e] = knowledge.Effective(e.Name, siblings).Score
-	}
-
+// dictionary is keyed by top-level folder names; excluding them there
+// would make sorting by size effectively never do anything below the top
+// level. For the default composite sort, Unknown's zero score already
+// sorts last on its own as a numeric tie-break, so no special case is
+// needed there either.
+func sortEntries(entries []*scan.Entry, col sortColumn, asc bool, scoreOf map[*scan.Entry]knowledge.Score) {
 	sort.SliceStable(entries, func(i, j int) bool {
 		a, b := entries[i], entries[j]
 
@@ -607,10 +789,11 @@ func sortEntries(entries []*scan.Entry, col sortColumn, asc bool) {
 }
 
 func (m Model) currentFrame() *navFrame {
-	if len(m.nav) == 0 {
+	nav := m.navs[m.activeTab]
+	if len(nav) == 0 {
 		return nil
 	}
-	return &m.nav[len(m.nav)-1]
+	return &nav[len(nav)-1]
 }
 
 func (m Model) currentEntries() []*scan.Entry {
@@ -622,8 +805,9 @@ func (m Model) currentEntries() []*scan.Entry {
 }
 
 func (m Model) breadcrumb() string {
-	labels := make([]string, len(m.nav))
-	for i, f := range m.nav {
+	nav := m.navs[m.activeTab]
+	labels := make([]string, len(nav))
+	for i, f := range nav {
 		labels[i] = f.label
 	}
 	return strings.Join(labels, " › ")
@@ -651,28 +835,42 @@ func (m Model) selectedEntry() *scan.Entry {
 	return entries[idx]
 }
 
-// knowledgeFor looks up e's dictionary entry with sibling context — e.g. so
-// a JetBrains IDE version folder knows whether a newer install of the same
-// IDE exists among its siblings and can be rated/cleaned accordingly. It's
-// safe to call for any entry: names that don't need sibling context just
-// fall through to a plain lookup.
+// knowledgeFor looks up e's dictionary entry using the entries currently on
+// screen as sibling context.
 func (m Model) knowledgeFor(e *scan.Entry) knowledge.Entry {
-	entries := m.currentEntries()
-	siblings := make([]string, len(entries))
-	for i, s := range entries {
-		siblings[i] = s.Name
-	}
-	return knowledge.Effective(e.Name, siblings)
+	return m.knowledgeIn(m.currentEntries(), e)
 }
 
-// rootTotalSize sums the known sizes of the top-level scan root, used for
-// the "(12.3 GB)" summary next to the System Data tab regardless of how
-// deep the current navigation is.
-func (m Model) rootTotalSize() (total int64, complete bool) {
-	if len(m.nav) == 0 {
+// knowledgeIn is knowledgeFor with an explicit sibling set, so sorting can
+// score a frame that isn't the visible one.
+//
+// Siblings are restricted to entries sharing e's root: the System Data tab
+// merges five Library folders into one listing, and the JetBrains
+// version-supersede rule compares folder names, so letting a Logs entry
+// count as a sibling of a Caches entry would compare unrelated things.
+func (m Model) knowledgeIn(all []*scan.Entry, e *scan.Entry) knowledge.Entry {
+	if k, ok := m.homeDB[e.Path]; ok {
+		return k
+	}
+	siblings := make([]string, 0, len(all))
+	for _, s := range all {
+		if s.Root == e.Root {
+			siblings = append(siblings, s.Name)
+		}
+	}
+	k := knowledge.Effective(knowledge.Root(e.Root), e.Name, siblings)
+	return knowledge.AnnotateOrphan(k, e.Name, m.appIndex)
+}
+
+// tabTotalSize sums the known sizes of a tab's landing listing, for the
+// "(12.3 GB)" summary in the tab bar, regardless of how deep the current
+// navigation is.
+func (m Model) tabTotalSize(t tab) (total int64, complete bool) {
+	nav := m.navs[t]
+	if len(nav) == 0 {
 		return 0, false
 	}
-	root := m.nav[0]
+	root := nav[0]
 	complete = !root.loading && len(root.entries) > 0
 	for _, e := range root.entries {
 		if !e.SizeReady {

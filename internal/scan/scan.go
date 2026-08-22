@@ -5,16 +5,73 @@
 package scan
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
-// Entry describes one top-level item found under a scanned root.
+// diskUsage reports how much space info actually occupies on disk, which is
+// what matters for "how much will I get back if I delete this" — not
+// info.Size(), the logical/apparent length.
+//
+// The two diverge wildly on sparse files, which macOS uses for VM disk
+// images: OrbStack's data.img.raw reports a 228 GB logical size while
+// occupying 12.6 GB of real blocks. Summing Size() there would claim a
+// single file fills a 228 GB disk. APFS also compresses files
+// transparently, where allocated blocks are again smaller than the logical
+// size.
+//
+// Stat_t.Blocks is in 512-byte units on Darwin regardless of the
+// filesystem's own block size — the same figure du(1) reports. If the
+// platform-specific stat isn't available for some reason, fall back to the
+// logical size rather than counting the file as zero.
+func diskUsage(info fs.FileInfo) int64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
+	}
+	return info.Size()
+}
+
+// fileID uniquely identifies a file on disk, so a tree walk can count
+// hard-linked content once instead of once per link. pnpm's store is the
+// motivating case: it hard-links the same package blobs into every
+// project's node_modules, so naive summing reports the same bytes many
+// times over. This mirrors du(1), which also counts a multiply-linked inode
+// only the first time it sees it.
+type fileID struct {
+	dev uint64
+	ino uint64
+}
+
+// statID returns info's identity and whether it's hard-linked at all.
+// Files with a single link can skip the bookkeeping entirely — that's the
+// overwhelming majority of them.
+func statID(info fs.FileInfo) (id fileID, linked bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Nlink <= 1 {
+		return fileID{}, false
+	}
+	return fileID{dev: uint64(st.Dev), ino: st.Ino}, true
+}
+
+// Entry describes one item found under a scanned root.
 type Entry struct {
-	Name      string
-	Path      string
-	Source    string // short label for which root this came from, e.g. "Cache"
+	Name string
+	Path string
+	// Source is the short TYPE-column label for the root this came from,
+	// e.g. "Cache" or "AppSupp".
+	Source string
+	// Root identifies which dictionary answers for this entry. It is a
+	// plain string rather than a knowledge.Root so this package stays
+	// independent of the dictionary; the UI converts it back. The System
+	// Data tab merges several roots into one table, and the same folder
+	// name means different things in each — Caches/Google is a disposable
+	// disk cache, Application Support/Google is the Chrome profile — so
+	// an entry that lost track of its root would be looked up against the
+	// wrong answers.
+	Root      string
 	ModTime   time.Time
 	IsDir     bool
 	Size      int64 // -1 until computed by the Scanner
@@ -22,13 +79,12 @@ type Entry struct {
 	SizeReady bool
 }
 
-// List returns the immediate children of root as unsized Entry values.
-// source is a short human-readable label (e.g. "Cache") recorded on each
-// entry to identify which scanned root it came from — System Data will
-// eventually aggregate several roots (Caches, Logs, Application Support,
-// ...) into one table.
-func List(root, source string) ([]*Entry, error) {
-	items, err := os.ReadDir(root)
+// List returns the immediate children of dir as unsized Entry values.
+// source is the short TYPE-column label and root is the dictionary key,
+// both stamped onto every entry so they survive into the merged System
+// Data table.
+func List(dir, source, root string) ([]*Entry, error) {
+	items, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -43,8 +99,9 @@ func List(root, source string) ([]*Entry, error) {
 		}
 		entries = append(entries, &Entry{
 			Name:    it.Name(),
-			Path:    filepath.Join(root, it.Name()),
+			Path:    filepath.Join(dir, it.Name()),
 			Source:  source,
+			Root:    root,
 			ModTime: info.ModTime(),
 			IsDir:   it.IsDir(),
 			Size:    -1,
@@ -53,11 +110,17 @@ func List(root, source string) ([]*Entry, error) {
 	return entries, nil
 }
 
-// DirSize walks path recursively and sums file sizes, also returning the
-// most recent modification time seen anywhere in the tree. Errors on
-// individual entries (permission denied, broken symlinks, races with files
-// disappearing mid-walk) are skipped rather than aborting the whole scan.
+// DirSize walks path recursively and sums how much space the tree actually
+// occupies on disk (see diskUsage), also returning the most recent
+// modification time seen anywhere in it. Hard-linked files are counted once.
+// Errors on individual entries (permission denied, broken symlinks, races
+// with files disappearing mid-walk) are skipped rather than aborting the
+// whole scan.
+//
+// Directories themselves contribute their own allocated blocks, matching
+// du(1) — a tree of many small directories isn't free.
 func DirSize(path string) (size int64, latest time.Time, err error) {
+	var seen map[fileID]struct{}
 	walkErr := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -66,15 +129,40 @@ func DirSize(path string) (size int64, latest time.Time, err error) {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() {
-			size += info.Size()
-		}
 		if t := info.ModTime(); t.After(latest) {
 			latest = t
 		}
+		// Symlinks are not followed by WalkDir; counting the link's own
+		// blocks (not its target's) is both what du does and what keeps a
+		// symlink loop from inflating the total.
+		if id, linked := statID(info); linked {
+			if seen == nil {
+				seen = make(map[fileID]struct{})
+			}
+			if _, dup := seen[id]; dup {
+				return nil
+			}
+			seen[id] = struct{}{}
+		}
+		size += diskUsage(info)
 		return nil
 	})
 	return size, latest, walkErr
+}
+
+// PathSize measures a single path whether it's a file or a directory,
+// returning its on-disk usage and newest mtime. Callers that have a bare
+// path and don't already know which it is (the curated Home-tab list, the
+// Applications tab) should use this rather than branching themselves.
+func PathSize(path string) (size int64, latest time.Time, err error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	if info.IsDir() {
+		return DirSize(path)
+	}
+	return diskUsage(info), info.ModTime(), nil
 }
 
 // GlobSize sums the size of everything matching pattern (a filepath.Glob
@@ -89,16 +177,11 @@ func GlobSize(pattern string) (int64, error) {
 	}
 	var total int64
 	for _, m := range matches {
-		info, err := os.Lstat(m)
+		size, _, err := PathSize(m)
 		if err != nil {
 			continue
 		}
-		if info.IsDir() {
-			size, _, _ := DirSize(m)
-			total += size
-			continue
-		}
-		total += info.Size()
+		total += size
 	}
 	return total, nil
 }
@@ -140,7 +223,7 @@ func NewScanner(workers int) *Scanner {
 
 func (s *Scanner) run() {
 	for path := range s.jobs {
-		size, latest, err := DirSize(path)
+		size, latest, err := PathSize(path)
 		s.Results <- SizeResult{Path: path, Size: size, ModTime: latest, Err: err}
 		time.Sleep(15 * time.Millisecond)
 	}

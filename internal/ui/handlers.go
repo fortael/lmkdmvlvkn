@@ -2,6 +2,8 @@ package ui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
+
+	"lmkdmvlvkn/internal/knowledge"
 )
 
 func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -15,39 +17,45 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case "tab", "right", "l":
 		m.activeTab = (m.activeTab + 1) % tabCount
+		m.detailScroll = 0
 		return m, nil
 
 	case "shift+tab", "left", "h":
 		m.activeTab = (m.activeTab - 1 + tabCount) % tabCount
+		m.detailScroll = 0
 		return m, nil
 
 	case "1":
 		m.activeTab = tabSystemData
+		m.detailScroll = 0
 		return m, nil
 	case "2":
 		m.activeTab = tabDocker
+		m.detailScroll = 0
 		return m, nil
 	case "3":
-		m.activeTab = tabFolders
+		m.activeTab = tabHome
+		m.detailScroll = 0
 		return m, nil
 	case "4":
 		m.activeTab = tabApplications
+		m.detailScroll = 0
 		return m, nil
 
 	case "up", "k":
-		if m.activeTab == tabSystemData {
+		if m.activeTab.browsable() {
 			m.moveSelection(-1)
 		}
 		return m, nil
 
 	case "down", "j":
-		if m.activeTab == tabSystemData {
+		if m.activeTab.browsable() {
 			m.moveSelection(1)
 		}
 		return m, nil
 
 	case "pgup", "K":
-		if m.activeTab == tabSystemData {
+		if m.activeTab.browsable() {
 			m.detailScroll -= detailScrollStep
 			if m.detailScroll < 0 {
 				m.detailScroll = 0
@@ -56,49 +64,43 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case "pgdown", "J":
-		if m.activeTab == tabSystemData {
+		if m.activeTab.browsable() {
 			m.detailScroll += detailScrollStep
 		}
 		return m, nil
 
 	case "enter":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
 		return m.openSelected()
 
 	case "esc", "backspace":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
 		return m.goUp(), nil
 
 	case "r":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
-		f := m.currentFrame()
-		if f == nil || f.loading {
-			return m, nil
-		}
-		f.loading = true
-		m.statusMsg = ""
-		return m, loadDirCmd(f.path, f.source)
+		return m.rescan()
 
 	case "d", "delete":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
 		return m.startClean()
 
 	case "n":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
 		return m.startNativeClean()
 
 	case "D":
-		if m.activeTab != tabSystemData {
+		if !m.activeTab.browsable() {
 			return m, nil
 		}
 		return m.startManualDelete()
@@ -150,6 +152,56 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+// rescan reloads the current frame. Synthetic frames (the System Data
+// aggregate, the curated Home list) can't just re-list a single directory,
+// so each is rebuilt the same way it was first assembled — reusing the
+// frame's existing id so the in-flight results still route back to it.
+func (m Model) rescan() (Model, tea.Cmd) {
+	f := m.currentFrame()
+	if f == nil || f.loading {
+		return m, nil
+	}
+	m.statusMsg = ""
+
+	// The curated Home list is built from a fixed list of paths with no
+	// directory listing behind it, so a rescan just re-resolves which of
+	// them still exist.
+	if m.activeTab == tabHome && len(m.navs[tabHome]) == 1 {
+		m.navs[tabHome] = []navFrame{m.buildHomeFrame()}
+		// Sizes are measured by the shared background scanner rather than
+		// a command, so there is nothing for Bubble Tea to run here.
+		for _, e := range m.navs[tabHome][0].entries {
+			m.scanner.Enqueue(e.Path)
+		}
+		return m, nil
+	}
+
+	f.entries = nil
+	f.selected = ""
+	f.loadErr = ""
+	f.loading = true
+
+	// The System Data landing frame merges several roots; everything else
+	// — including any folder drilled into from it — is one real directory.
+	if f.path == "" && m.activeTab == tabSystemData {
+		roots := knowledge.SystemDataRoots()
+		f.pending = len(roots)
+		cmds := make([]tea.Cmd, 0, len(roots))
+		for _, r := range roots {
+			cmds = append(cmds, loadDirCmd(f.id, r.Path, r.Label, string(r.Root)))
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	if f.path == "" && m.activeTab == tabApplications {
+		f.pending = 1
+		return m, loadAppsCmd(f.id)
+	}
+
+	f.pending = 1
+	return m, loadDirCmd(f.id, f.path, f.source, string(f.root))
 }
 
 // startClean validates the current selection can be cleaned and, if so,
@@ -222,13 +274,14 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 		for _, r := range m.tabRegionsFor() {
 			if msg.X >= r.x0 && msg.X <= r.x1 {
 				m.activeTab = r.tab
+				m.detailScroll = 0
 				return m, nil
 			}
 		}
 		return m, nil
 	}
 
-	if m.activeTab != tabSystemData || m.mode != modeNormal || m.cleaning {
+	if !m.activeTab.browsable() || m.mode != modeNormal || m.cleaning {
 		return m, nil
 	}
 
@@ -265,8 +318,8 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 // already active. NAME defaults to ascending (A→Z first); the size/mod/
 // safety columns default to descending (biggest/newest/safest first) —
 // whichever reads naturally on a first click. Every currently-loaded
-// directory is re-sorted immediately so navigating back into one respects
-// the new order without waiting on a fresh scan message.
+// frame, on every tab, is re-sorted immediately so navigating back into
+// one respects the new order without waiting on a fresh scan message.
 func (m Model) clickSort(col sortColumn) Model {
 	if m.sortCol == col {
 		m.sortAsc = !m.sortAsc
@@ -274,39 +327,47 @@ func (m Model) clickSort(col sortColumn) Model {
 		m.sortCol = col
 		m.sortAsc = col == sortByName
 	}
-	for fi := range m.nav {
-		sortEntries(m.nav[fi].entries, m.sortCol, m.sortAsc)
+	for ti := range m.navs {
+		for fi := range m.navs[ti] {
+			m.sortFrame(&m.navs[ti][fi])
+		}
 	}
 	return m
 }
 
 // openSelected drills into the selected directory, pushing a new nav
 // frame and kicking off a listing for it. Non-directory entries (stray
-// files directly under Caches) have nothing to open.
+// files, and the handful of plain files on the Home tab) have nothing to
+// open.
+//
+// The child inherits the parent row's own root and TYPE label rather than
+// the frame's, which is what makes drilling in from the merged System Data
+// listing work: a row from Application Support keeps answering to the
+// Application Support dictionary once opened.
 func (m Model) openSelected() (Model, tea.Cmd) {
 	e := m.selectedEntry()
 	if e == nil || !e.IsDir {
 		return m, nil
 	}
-	f := m.currentFrame()
-	source := "Cache"
-	if f != nil {
-		source = f.source
-	}
-	m.nav = append(m.nav, navFrame{
+	root := knowledge.Root(e.Root)
+	f := navFrame{
+		id:      m.newFrameID(),
 		label:   e.Name,
 		path:    e.Path,
-		source:  source,
+		root:    root,
+		source:  e.Source,
 		loading: true,
-	})
+		pending: 1,
+	}
+	m.navs[m.activeTab] = append(m.navs[m.activeTab], f)
 	m.detailScroll = 0
-	return m, loadDirCmd(e.Path, source)
+	return m, loadDirCmd(f.id, e.Path, e.Source, e.Root)
 }
 
 // goUp pops back to the parent directory, if any.
 func (m Model) goUp() Model {
-	if len(m.nav) > 1 {
-		m.nav = m.nav[:len(m.nav)-1]
+	if nav := m.navs[m.activeTab]; len(nav) > 1 {
+		m.navs[m.activeTab] = nav[:len(nav)-1]
 		m.detailScroll = 0
 	}
 	return m

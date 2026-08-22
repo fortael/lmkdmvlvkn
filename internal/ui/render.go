@@ -118,11 +118,11 @@ const (
 	wideBreakpoint = 120
 )
 
-// systemDataLayout computes the table/detail panel heights for the current
+// contentLayout computes the table/detail panel heights for the current
 // terminal size. It's the single source of truth for that split so
 // rendering and mouse hit-testing (which needs to know where the button
-// row starts) can never disagree.
-func (m Model) systemDataLayout() (tableH, detailH int) {
+// row starts) can never disagree. Every browsable tab shares the layout.
+func (m Model) contentLayout() (tableH, detailH int) {
 	contentH := m.height - tabBarHeight - breadcrumbHeight - cleanButtonHeight - 1
 	if contentH < 6 {
 		contentH = 6
@@ -140,7 +140,7 @@ func (m Model) systemDataLayout() (tableH, detailH int) {
 
 // buttonRowY is the screen row the clean/native-clean buttons start on.
 func (m Model) buttonRowY() int {
-	tableH, detailH := m.systemDataLayout()
+	tableH, detailH := m.contentLayout()
 	return tabBarHeight + breadcrumbHeight + tableH + detailH
 }
 
@@ -168,7 +168,7 @@ func (m Model) render() string {
 	b.WriteString(m.renderTabs())
 	b.WriteString("\n")
 
-	if m.activeTab != tabSystemData {
+	if !m.activeTab.browsable() {
 		contentH := m.height - tabBarHeight - 1
 		if contentH < 6 {
 			contentH = 6
@@ -183,7 +183,7 @@ func (m Model) render() string {
 	// between the table and the detail panel. Both hard-clip/scroll their
 	// content to the height they're given so nothing can ever push the
 	// button or help line off screen.
-	tableH, detailH := m.systemDataLayout()
+	tableH, detailH := m.contentLayout()
 
 	b.WriteString(m.renderBreadcrumb(m.width))
 	b.WriteString("\n")
@@ -198,19 +198,20 @@ func (m Model) render() string {
 	return appStyle.Render(b.String())
 }
 
-// tabLabel returns the plain (unstyled) label for t, including the size
-// summary suffix on the System Data tab once at least some sizes are
-// known ("+" while the scan is still incomplete).
+// tabLabel returns the plain (unstyled) label for t, including a size
+// summary once at least some sizes are known ("+" while that tab's scan is
+// still incomplete).
 func (m Model) tabLabel(t tab) string {
 	label := t.String()
-	if t == tabSystemData {
-		if total, complete := m.rootTotalSize(); total > 0 {
-			suffix := "+"
-			if complete {
-				suffix = ""
-			}
-			label = fmt.Sprintf("%s (%s%s)", label, formatSize(total), suffix)
+	if !t.browsable() {
+		return label
+	}
+	if total, complete := m.tabTotalSize(t); total > 0 {
+		suffix := "+"
+		if complete {
+			suffix = ""
 		}
+		label = fmt.Sprintf("%s (%s%s)", label, formatSize(total), suffix)
 	}
 	return label
 }
@@ -248,7 +249,7 @@ func (m Model) renderTabs() string {
 
 func (m Model) renderBreadcrumb(width int) string {
 	text := m.breadcrumb()
-	if len(m.nav) > 1 {
+	if len(m.navs[m.activeTab]) > 1 {
 		text += "   (Esc/Backspace to go up)"
 	}
 	return dimStyle.Render(truncate(text, width))
@@ -428,6 +429,9 @@ func (m Model) renderRow(e *scan.Entry, selected bool, nameW int, max int64, inn
 		name += "  (versions ›)"
 	case e.IsDir:
 		name += " ›"
+	}
+	if k.Orphan {
+		name += "  ⚠ leftover"
 	}
 	nameSeg := rowStyle.Render(padRight(truncate(name, nameW), nameW))
 
@@ -622,6 +626,9 @@ func (m Model) buildMetaLines(e *scan.Entry, k knowledge.Entry, w int) []string 
 	// needs ANSI-aware truncation (plain truncate() would miscount the
 	// embedded escape codes as visible characters).
 	lines = append(lines, ansi.Truncate(fmt.Sprintf("Safety: %s %s", renderStars(k.Score), scoreLabel(k.Score)), w, "…"))
+	if k.Orphan {
+		lines = append(lines, yellowStyle.Render(truncate("⚠ No installed app owns this", w)))
+	}
 	switch {
 	case k.Container:
 		for _, l := range wrapText("Enter to open — holds several version caches, see inside to clean them", w) {
@@ -635,18 +642,26 @@ func (m Model) buildMetaLines(e *scan.Entry, k knowledge.Entry, w int) []string 
 		lines = append(lines, "")
 		lines = append(lines, boldStyle.Render("Commands"))
 		info, haveReclaim := m.reclaimCache[e.Path]
-		zipped := haveReclaim && info.ready && len(k.CleanPaths) == len(k.Commands)
-		for i, cmd := range k.Commands {
+		// Commands and CleanPaths line up one-to-one only after comment
+		// lines are dropped — entries commonly open with a "# Quit X
+		// first" note — so track a separate cursor into CleanPaths that
+		// advances on real commands alone. Zipping on raw index would
+		// shift every size onto the wrong command as soon as a comment
+		// appeared.
+		zipped := haveReclaim && info.ready && countRealCommands(k.Commands) == len(k.CleanPaths)
+		pathIdx := 0
+		for _, cmd := range k.Commands {
 			if strings.HasPrefix(cmd, "#") {
 				lines = append(lines, faintStyle.Render(truncate(cmd, w)))
 				continue
 			}
 			sizeSuffix := ""
 			if zipped {
-				if sz, ok := info.perPath[k.CleanPaths[i]]; ok {
+				if sz, ok := info.perPath[k.CleanPaths[pathIdx]]; ok {
 					sizeSuffix = "  (" + formatSize(sz) + ")"
 				}
 			}
+			pathIdx++
 			cmdW := w - 2 - displayWidth(sizeSuffix)
 			line := accentStyle.Render("$ ") + dimStyle.Render(truncate(cmd, cmdW))
 			if sizeSuffix != "" {
@@ -663,6 +678,19 @@ func (m Model) buildMetaLines(e *scan.Entry, k knowledge.Entry, w int) []string 
 		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate(k.Native.Command, w-2)))
 	}
 	return lines
+}
+
+// countRealCommands counts the commands that actually run, ignoring the
+// "#"-prefixed annotation lines the dictionary uses for prerequisites and
+// equivalences.
+func countRealCommands(cmds []string) int {
+	n := 0
+	for _, c := range cmds {
+		if !strings.HasPrefix(c, "#") {
+			n++
+		}
+	}
+	return n
 }
 
 // buildDescLines renders the descriptive half — what the folder is and
@@ -948,7 +976,7 @@ func (m Model) renderHelp() string {
 	}
 	left := "↑/↓ select   Enter open   d clean   n native clean   D delete   Esc/⌫ back   PgUp/PgDn scroll   " +
 		"click headers to sort   tab switch   r rescan   q quit"
-	if m.activeTab != tabSystemData {
+	if !m.activeTab.browsable() {
 		left = "tab switch tabs   q quit"
 	}
 	if m.statusMsg != "" {
