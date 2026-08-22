@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"lmkdmvlvkn/internal/history"
 	"lmkdmvlvkn/internal/knowledge"
 	"lmkdmvlvkn/internal/scan"
 )
@@ -255,5 +258,383 @@ func TestSameNameDifferentRootsGetDifferentKnowledge(t *testing.T) {
 	}
 	if len(ka.CleanPaths) == 0 {
 		t.Error("Application Support/Google should clean specific subpaths, never the whole profile")
+	}
+}
+
+// --- batch selection -----------------------------------------------------
+
+// sysDataWith builds a model whose System Data listing holds the given
+// rows, with the terminal already sized.
+func sysDataWith(t *testing.T, entries ...*scan.Entry) Model {
+	t.Helper()
+	m := sized(t, 150, 45)
+	next, _ := m.Update(entriesLoadedMsg{frameID: m.navs[tabSystemData][0].id, entries: entries})
+	return next.(Model)
+}
+
+func pressKey(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	var msg tea.KeyMsg
+	if s == " " {
+		msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
+	} else {
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	next, _ := m.Update(msg)
+	return next.(Model)
+}
+
+// Space ticks a row into the batch; pressing it again unticks.
+func TestSpaceTogglesSelection(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+
+	m = pressKey(t, m, " ")
+	if len(m.selOrder) != 1 {
+		t.Fatalf("selected %d rows after space, want 1", len(m.selOrder))
+	}
+	m = pressKey(t, m, " ")
+	if len(m.selOrder) != 0 {
+		t.Errorf("selected %d rows after a second space, want 0", len(m.selOrder))
+	}
+}
+
+// A row the dictionary knows nothing about offers no action, so it can't
+// join a batch — the same gate that blocks the single-item clean.
+func TestUnknownRowCannotBeSelected(t *testing.T) {
+	m := sysDataWith(t, entry("no-such-folder-anywhere", "/tmp/unk", "Cache", knowledge.RootCaches, 1<<20))
+	m = pressKey(t, m, " ")
+	if len(m.selOrder) != 0 {
+		t.Error("an unresearched row was added to the batch")
+	}
+	if m.statusMsg == "" {
+		t.Error("selecting an unusable row should explain why nothing happened")
+	}
+}
+
+// Protected storage is excluded from every path, batch included.
+func TestProtectedRowCannotBeSelected(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	orb := entry("HUAQ24HBR6.dev.orbstack",
+		home+"/Library/Group Containers/HUAQ24HBR6.dev.orbstack", "GroupC", knowledge.RootGroupContainers, 12<<30)
+	m := sysDataWith(t, orb)
+	m = pressKey(t, m, " ")
+	if len(m.selOrder) != 0 {
+		t.Error("OrbStack storage was added to a batch; it must never be actionable")
+	}
+}
+
+// The steps must run in the order the user ticked them, which is the
+// order they walked the table in.
+func TestBatchPreservesSelectionOrder(t *testing.T) {
+	m := sysDataWith(t,
+		entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 3<<30),
+		entry("Homebrew", "/tmp/brew", "Cache", knowledge.RootCaches, 2<<30),
+		entry("node-gyp", "/tmp/gyp", "Cache", knowledge.RootCaches, 1<<30),
+	)
+	// Walk down the table ticking every row.
+	for i := 0; i < 3; i++ {
+		m = pressKey(t, m, " ")
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(Model)
+	}
+
+	steps := m.orderedSteps()
+	if len(steps) != 3 {
+		t.Fatalf("queued %d steps, want 3", len(steps))
+	}
+	for i, want := range []string{"go-build", "Homebrew", "node-gyp"} {
+		if steps[i].name != want {
+			t.Errorf("step %d = %q, want %q (selection order not preserved)", i, steps[i].name, want)
+		}
+	}
+}
+
+// Where a tool ships its own cleanup command it must be preferred over
+// deleting files ourselves — that was the explicit requirement.
+func TestBatchPrefersNativeCleanWhenAvailable(t *testing.T) {
+	m := sysDataWith(t, entry("Homebrew", "/tmp/brew", "Cache", knowledge.RootCaches, 1<<30))
+	m = pressKey(t, m, " ")
+
+	steps := m.orderedSteps()
+	if len(steps) != 1 {
+		t.Fatalf("queued %d steps, want 1", len(steps))
+	}
+	if steps[0].action != batchNative {
+		t.Errorf("action = %v, want batchNative (Homebrew defines one)", steps[0].action)
+	}
+	if steps[0].command == "" {
+		t.Error("a native step must carry the command to run")
+	}
+}
+
+// Without a native command the step falls back to the dictionary's own
+// clean paths.
+func TestBatchFallsBackToCleanWithoutNative(t *testing.T) {
+	m := sysDataWith(t, entry("node-gyp", "/tmp/gyp", "Cache", knowledge.RootCaches, 1<<30))
+	m = pressKey(t, m, " ")
+	steps := m.orderedSteps()
+	if len(steps) != 1 || steps[0].action != batchClean {
+		t.Fatalf("steps = %+v, want a single batchClean", steps)
+	}
+}
+
+// The button has to show what the user is about to get back.
+func TestSelectionTotalSumsWholeFolderEstimates(t *testing.T) {
+	m := sysDataWith(t,
+		entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 3<<30),
+		entry("node-gyp", "/tmp/gyp", "Cache", knowledge.RootCaches, 1<<30),
+	)
+	m = pressKey(t, m, " ")
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	m = pressKey(t, m, " ")
+
+	total, complete := m.selectionTotal()
+	if !complete {
+		t.Error("both rows have known sizes and no CleanPaths; the total should be exact")
+	}
+	if total != 4<<30 {
+		t.Errorf("total = %d, want %d", total, int64(4)<<30)
+	}
+}
+
+// x drops the whole queue without running anything.
+func TestClearSelectionEmptiesTheQueue(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	m = pressKey(t, m, " ")
+	m = pressKey(t, m, "x")
+	if len(m.selOrder) != 0 || len(m.selected) != 0 {
+		t.Errorf("selection survived x: %d order / %d map", len(m.selOrder), len(m.selected))
+	}
+}
+
+// c opens the confirm screen rather than deleting immediately.
+func TestRunBatchAsksForConfirmationFirst(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	m = pressKey(t, m, " ")
+	m = pressKey(t, m, "c")
+	if m.mode != modeConfirmBatch {
+		t.Fatalf("mode = %v, want modeConfirmBatch", m.mode)
+	}
+	if m.cleaning {
+		t.Error("the batch started without confirmation")
+	}
+	if strings.TrimSpace(m.View()) == "" {
+		t.Error("the batch confirm screen rendered empty")
+	}
+}
+
+// An empty queue has nothing to confirm.
+func TestRunBatchDoesNothingWithEmptySelection(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	m = pressKey(t, m, "c")
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+}
+
+// --- leftovers -----------------------------------------------------------
+
+// The Leftovers tab is a live projection of the System Data scan: only
+// rows whose owning app is gone, sharing the very same entry pointers.
+func TestLeftoversTabCollectsOrphansOnly(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+
+	live := entry("com.google.Chrome", "/tmp/chrome", "Cache", knowledge.RootCaches, 1<<20)
+	gone := entry("com.vanished.EditorPro", "/tmp/gone", "Cache", knowledge.RootCaches, 5<<20)
+	next, _ := m.Update(entriesLoadedMsg{frameID: m.navs[tabSystemData][0].id, entries: []*scan.Entry{live, gone}})
+	m = next.(Model)
+
+	got := m.navs[tabLeftovers][0].entries
+	if len(got) != 1 {
+		t.Fatalf("Leftovers holds %d rows, want 1", len(got))
+	}
+	if got[0].Name != "com.vanished.EditorPro" {
+		t.Errorf("Leftovers holds %q, want the uninstalled app's folder", got[0].Name)
+	}
+	if got[0] != gone {
+		t.Error("Leftovers should reuse the System Data entry pointer so sizes stay in sync")
+	}
+}
+
+// Select-all is what makes the tab worth having; every row must queue as
+// a whole-folder delete, since the owning app is already gone.
+func TestLeftoversSelectAllQueuesDeletes(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+	next, _ := m.Update(entriesLoadedMsg{
+		frameID: m.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{
+			entry("com.gone.One", "/tmp/one", "Cache", knowledge.RootCaches, 1<<20),
+			entry("com.gone.Two", "/tmp/two", "Cache", knowledge.RootCaches, 2<<20),
+		},
+	})
+	m = next.(Model)
+	m.activeTab = tabLeftovers
+
+	m = pressKey(t, m, "a")
+	steps := m.orderedSteps()
+	if len(steps) != 2 {
+		t.Fatalf("queued %d steps, want 2", len(steps))
+	}
+	for _, s := range steps {
+		if s.action != batchDelete {
+			t.Errorf("%s queued as %v, want batchDelete", s.name, s.action)
+		}
+	}
+	if total, _ := m.selectionTotal(); total != 3<<20 {
+		t.Errorf("total = %d, want %d", total, int64(3)<<20)
+	}
+}
+
+// --- results -------------------------------------------------------------
+
+func TestResultsTabRendersEmptyAndPopulated(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.activeTab = tabResults
+	if strings.TrimSpace(m.View()) == "" {
+		t.Error("Results rendered empty with no history")
+	}
+
+	next, _ := m.Update(historyLoadedMsg{
+		records: []history.Record{
+			{Time: time.Now(), Name: "go-build", Path: "/tmp/gb", Source: "System Data",
+				Action: history.ActionNative, Freed: 2 << 30},
+			{Time: time.Now().Add(-time.Hour), Name: "broken", Path: "/tmp/b",
+				Action: history.ActionClean, Err: "permission denied"},
+		},
+		disk: scan.DiskUsage{Total: 200 << 30, Free: 20 << 30, Used: 180 << 30},
+	})
+	m = next.(Model)
+
+	if m.historyTotal != 2<<30 {
+		t.Errorf("historyTotal = %d, want %d (failures contribute nothing)", m.historyTotal, int64(2)<<30)
+	}
+	out := m.View()
+	if !strings.Contains(out, "go-build") {
+		t.Error("Results should list the cleaned entry")
+	}
+	if strings.TrimSpace(out) == "" {
+		t.Error("Results rendered empty with history present")
+	}
+}
+
+func TestClearHistoryAsksFirst(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.activeTab = tabResults
+	next, _ := m.Update(historyLoadedMsg{
+		records: []history.Record{{Time: time.Now(), Name: "x", Freed: 1 << 20}},
+		disk:    scan.DiskUsage{Total: 100 << 30},
+	})
+	m = next.(Model)
+
+	m = pressKey(t, m, "c")
+	if m.mode != modeConfirmClearHistory {
+		t.Fatalf("mode = %v, want modeConfirmClearHistory", m.mode)
+	}
+	if strings.TrimSpace(m.View()) == "" {
+		t.Error("the clear-history confirm rendered empty")
+	}
+}
+
+// Seven tabs overflow a normal terminal once every label carries a size
+// suffix; the bar must shed the suffixes rather than wrap.
+func TestTabBarDropsSizesWhenTooNarrow(t *testing.T) {
+	m := sized(t, 60, 45)
+	next, _ := m.Update(entriesLoadedMsg{
+		frameID: m.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 9<<30)},
+	})
+	m = next.(Model)
+
+	if got := m.tabLabel(tabSystemData); got != "System Data" {
+		t.Errorf("narrow tab label = %q, want the bare name", got)
+	}
+
+	wide := sized(t, 220, 45)
+	next, _ = wide.Update(entriesLoadedMsg{
+		frameID: wide.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 9<<30)},
+	})
+	wide = next.(Model)
+	if got := wide.tabLabel(tabSystemData); !strings.Contains(got, "GB") {
+		t.Errorf("wide tab label = %q, want a size summary", got)
+	}
+}
+
+// --- docker rows are not files -------------------------------------------
+
+func dockerEntry(name, id string, size int64) *scan.Entry {
+	return &scan.Entry{
+		Name: name, Path: "docker://Image/" + id, Source: "Image",
+		Root: string(knowledge.RootDocker), Size: size, SizeReady: true,
+	}
+}
+
+// A Docker object's "path" is an identifier. It must never reach
+// os.RemoveAll, which is what the manual-delete override would do.
+func TestDockerRowRefusesManualDelete(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.activeTab = tabDocker
+	f := &m.navs[tabDocker][0]
+	f.loading = false
+	f.entries = []*scan.Entry{dockerEntry("postgres:16", "abc123", 400<<20)}
+	f.selected = f.entries[0].Path
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	m = next.(Model)
+	if m.mode == modeConfirmManualDelete {
+		t.Error("manual delete was offered for a Docker object; there is no file to delete")
+	}
+	if m.statusMsg == "" {
+		t.Error("refusing manual delete should say why")
+	}
+}
+
+// Selecting a Docker row queues its own CLI command, flagged virtual so
+// runStep never stats or removes the synthetic path.
+func TestDockerStepIsVirtualAndNative(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.activeTab = tabDocker
+	e := dockerEntry("dangling", "def456", 700<<20)
+	m.pathDB[e.Path] = knowledge.Entry{
+		Score:       knowledge.Safe,
+		Description: "A dangling image.",
+		Native:      &knowledge.NativeClean{Description: "d", Command: "docker rmi def456"},
+	}
+	f := &m.navs[tabDocker][0]
+	f.loading = false
+	f.entries = []*scan.Entry{e}
+	f.selected = e.Path
+
+	step, ok := m.selectableStep(e)
+	if !ok {
+		t.Fatal("a removable Docker object should be selectable")
+	}
+	if !step.virtual {
+		t.Error("Docker steps must be marked virtual")
+	}
+	if step.action != batchNative || step.command != "docker rmi def456" {
+		t.Errorf("step = %v/%q, want batchNative running Docker's own command", step.action, step.command)
+	}
+	if step.estimate != 700<<20 || !step.estimateReady {
+		t.Errorf("estimate = %d/%v, want Docker's reported size", step.estimate, step.estimateReady)
+	}
+}
+
+// The guard itself: a virtual step that somehow asks for a filesystem
+// removal must fail rather than touch the disk.
+func TestRunStepRefusesVirtualFilesystemRemoval(t *testing.T) {
+	dir := t.TempDir()
+	freed, err := runStep(batchStep{path: dir, name: "x", virtual: true, action: batchDelete})
+	if err == nil {
+		t.Fatal("a virtual delete step must be refused")
+	}
+	if freed != 0 {
+		t.Errorf("freed = %d, want 0", freed)
+	}
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Error("the refused step deleted the directory anyway")
 	}
 }

@@ -342,7 +342,7 @@ func TestAnnotateOrphanDoesNotChangeCleanability(t *testing.T) {
 	ix := testIndex("com.google.Chrome")
 	base := Entry{Score: Risky, Description: "Something.", Effects: "Effects.", Commands: []string{"rm -rf x"}}
 
-	got := AnnotateOrphan(base, "com.vanished.Thing", ix)
+	got := AnnotateOrphan(base, RootCaches, "com.vanished.Thing", ix)
 	if !got.Orphan {
 		t.Fatal("want Orphan set for an uninstalled bundle")
 	}
@@ -360,7 +360,7 @@ func TestAnnotateOrphanDoesNotChangeCleanability(t *testing.T) {
 	}
 
 	// An unknown folder stays unknown and uncleanable even when orphaned.
-	unknown := AnnotateOrphan(Entry{Score: Unknown}, "com.vanished.Thing", ix)
+	unknown := AnnotateOrphan(Entry{Score: Unknown}, RootCaches, "com.vanished.Thing", ix)
 	if unknown.CanClean() {
 		t.Error("an orphaned Unknown entry must still not be cleanable")
 	}
@@ -369,11 +369,143 @@ func TestAnnotateOrphanDoesNotChangeCleanability(t *testing.T) {
 func TestAnnotateOrphanLeavesInstalledAppsAlone(t *testing.T) {
 	ix := testIndex("com.google.Chrome")
 	base := Entry{Score: Safe, Description: "Chrome cache."}
-	got := AnnotateOrphan(base, "com.google.Chrome", ix)
+	got := AnnotateOrphan(base, RootCaches, "com.google.Chrome", ix)
 	if got.Orphan {
 		t.Error("installed app must not be flagged")
 	}
 	if got.Description != base.Description {
 		t.Errorf("Description = %q, want unchanged", got.Description)
+	}
+}
+
+// --- protected storage ---------------------------------------------------
+
+// OrbStack's VM storage is shown and explained but never acted on, and
+// that has to hold for everything nested inside it — drilling in would
+// otherwise reach data.img.raw, whose removal destroys every Docker image,
+// container and volume on the machine.
+func TestProtectCoversOrbStackAndItsContents(t *testing.T) {
+	home := "/Users/x/Library/"
+	protected := []string{
+		home + "Group Containers/HUAQ24HBR6.dev.orbstack",
+		home + "Group Containers/HUAQ24HBR6.dev.orbstack/data",
+		home + "Group Containers/HUAQ24HBR6.dev.orbstack/data/data.img.raw",
+		home + "Caches/dev.kdrag0n.MacVirt",
+		home + "Caches/dev.kdrag0n.MacVirt/anything/deeper",
+		"/Applications/OrbStack.app",
+		"/Applications/OrbStack.app/Contents/MacOS",
+	}
+	for _, path := range protected {
+		got := Protect(Entry{Score: Safe, Description: "x", Commands: []string{"rm -rf x"}}, path)
+		if !got.Protected {
+			t.Errorf("%s: want Protected", path)
+		}
+		if got.CanClean() {
+			t.Errorf("%s: CanClean() = true, want false", path)
+		}
+		if got.CanDelete() {
+			t.Errorf("%s: CanDelete() = true, want false (not even the manual override)", path)
+		}
+		if len(got.Commands) != 0 || len(got.CleanPaths) != 0 || got.Native != nil {
+			t.Errorf("%s: clean actions survived protection", path)
+		}
+	}
+}
+
+// Protection must not spill onto unrelated folders that merely look similar.
+func TestProtectLeavesOtherPathsAlone(t *testing.T) {
+	for _, path := range []string{
+		"/Users/x/Library/Caches/Google",
+		"/Users/x/Library/Group Containers/2BBY89MBSN.dev.warp",
+		"/Users/x/Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram",
+		"/Users/x/Library/Application Support/JetBrains",
+		"/Applications/Orbit.app",
+		"/Users/x/orbstack-notes",
+	} {
+		base := Entry{Score: Safe, Description: "x", Commands: []string{"rm -rf x"}}
+		got := Protect(base, path)
+		if got.Protected {
+			t.Errorf("%s: was protected; the rule is meant to cover OrbStack only", path)
+		}
+		if !got.CanClean() {
+			t.Errorf("%s: lost its clean action", path)
+		}
+	}
+}
+
+func TestProtectExplainsItself(t *testing.T) {
+	got := Protect(Entry{Score: Risky}, "/Users/x/Library/Group Containers/HUAQ24HBR6.dev.orbstack")
+	if got.Description == "" {
+		t.Fatal("a protected entry with no dictionary text should still explain itself")
+	}
+	if !strings.Contains(got.Description, "OrbStack") {
+		t.Errorf("Description should name the owning app, got %q", got.Description)
+	}
+}
+
+// The Applications tab lists the apps themselves, so "is this app
+// installed" is incoherent there — and a bundle's folder name is not its
+// identifier, so asking anyway mislabels installed apps. zoom.us.app is
+// the real case: it parses as a bundle ID but Zoom ships as us.zoom.xos.
+func TestAnnotateOrphanSkipsNonLibraryRoots(t *testing.T) {
+	ix := testIndex("us.zoom.xos", "com.google.Chrome")
+	for _, root := range []Root{RootApplications, RootHome} {
+		got := AnnotateOrphan(Entry{Score: Caution, Description: "x"}, root, "zoom.us.app", ix)
+		if got.Orphan {
+			t.Errorf("%s/zoom.us.app was flagged as a leftover; Zoom is installed", root)
+		}
+	}
+	// The same name under a Library root still gets the normal treatment.
+	if got := AnnotateOrphan(Entry{Score: Caution}, RootCaches, "com.gone.App", ix); !got.Orphan {
+		t.Error("Caches/com.gone.App should still be flagged")
+	}
+}
+
+// Dictionary files are merged per root, so a key defined twice would have
+// one definition silently win — and the loser might be the safer one.
+func TestNoDuplicateDictionaryKeys(t *testing.T) {
+	pairs := []struct {
+		root   string
+		tables map[string]map[string]Entry
+	}{
+		{"Caches", map[string]map[string]Entry{"cachesDB": cachesDB, "ideCachesDB": ideCachesDB}},
+		{"Application Support", map[string]map[string]Entry{"appSupportDB": appSupportDB, "ideAppSupportDB": ideAppSupportDB}},
+	}
+	for _, p := range pairs {
+		seen := make(map[string]string)
+		for tableName, table := range p.tables {
+			for key := range table {
+				if prev, dup := seen[key]; dup {
+					t.Errorf("%s: key %q defined in both %s and %s", p.root, key, prev, tableName)
+				}
+				seen[key] = tableName
+			}
+		}
+	}
+}
+
+// Community editions use different folder prefixes (IdeaIC, PyCharmCE)
+// than their commercial counterparts, and newer products were added after
+// the pattern was first written. Missing one means that IDE's versioned
+// folders silently read as Unknown and are never offered for cleaning.
+func TestJetBrainsPatternCoversCommunityAndNewerProducts(t *testing.T) {
+	for _, name := range []string{
+		"IntelliJIdea2026.1", "IdeaIC2026.1", "PyCharm2026.1", "PyCharmCE2026.1",
+		"GoLand2026.2", "WebStorm2026.1", "PhpStorm2026.2", "CLion2026.1",
+		"Rider2026.1", "DataGrip2026.1", "DataSpell2026.1", "RubyMine2026.1",
+		"RustRover2026.2", "Aqua2026.1", "Writerside2026.1", "MPS2026.1",
+	} {
+		if _, _, _, ok := parseJetBrainsVersion(name); !ok {
+			t.Errorf("%s is not recognised as a JetBrains version folder", name)
+		}
+		if got := Lookup(RootCaches, name); got.Score == Unknown {
+			t.Errorf("Caches/%s resolved to Unknown; the pattern should describe it", name)
+		}
+	}
+	// Things that merely look similar must not match.
+	for _, name := range []string{"Goland", "Phpstorm", "JetBrains", "Toolbox", "GoLand", "GoLand2026"} {
+		if _, _, _, ok := parseJetBrainsVersion(name); ok {
+			t.Errorf("%s matched the versioned-folder pattern but is not one", name)
+		}
 	}
 }

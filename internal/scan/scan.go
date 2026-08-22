@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -196,40 +197,93 @@ type SizeResult struct {
 }
 
 // Scanner measures directory sizes in the background using a small, fixed
-// pool of workers so a large cache listing doesn't saturate the disk or
-// CPU. Callers enqueue paths and receive results asynchronously off
-// Results.
+// pool of workers so a large listing doesn't saturate the disk or CPU.
+// Callers enqueue paths and receive results asynchronously off Results.
+//
+// The pending queue is unbounded, and deliberately so. Enqueue is called
+// from the UI's update loop, which must never block: a bounded channel
+// deadlocks the whole app once it fills, because the blocked UI then stops
+// draining Results, which in turn blocks every worker. That is not
+// hypothetical — the five Library roots produce well over a thousand
+// entries between them, several times any buffer worth hard-coding.
 type Scanner struct {
-	jobs    chan string
+	mu      sync.Mutex
+	wake    *sync.Cond
+	pending []string
 	Results chan SizeResult
 }
 
-// NewScanner starts workers goroutines pulling from an internal job queue.
-// A short pause between jobs on each worker keeps the scan background-
+// NewScanner starts workers goroutines pulling from the pending queue. A
+// short pause between jobs on each worker keeps the scan background-
 // friendly rather than maximizing throughput.
 func NewScanner(workers int) *Scanner {
 	if workers < 1 {
 		workers = 1
 	}
-	s := &Scanner{
-		jobs:    make(chan string, 512),
-		Results: make(chan SizeResult, 512),
-	}
+	s := &Scanner{Results: make(chan SizeResult, 512)}
+	s.wake = sync.NewCond(&s.mu)
 	for i := 0; i < workers; i++ {
 		go s.run()
 	}
 	return s
 }
 
+// next pops the oldest pending path, sleeping until one is available.
+func (s *Scanner) next() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.pending) == 0 {
+		s.wake.Wait()
+	}
+	path := s.pending[0]
+	// Release the drained backing array rather than re-slicing forever,
+	// so repeated rescans don't retain every path ever queued.
+	if len(s.pending) == 1 {
+		s.pending = nil
+	} else {
+		s.pending = s.pending[1:]
+	}
+	return path
+}
+
 func (s *Scanner) run() {
-	for path := range s.jobs {
+	for {
+		path := s.next()
 		size, latest, err := PathSize(path)
 		s.Results <- SizeResult{Path: path, Size: size, ModTime: latest, Err: err}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-// Enqueue schedules path for background size computation.
+// Enqueue schedules path for background size computation. It never blocks,
+// however far behind the workers are.
 func (s *Scanner) Enqueue(path string) {
-	s.jobs <- path
+	s.mu.Lock()
+	s.pending = append(s.pending, path)
+	s.mu.Unlock()
+	s.wake.Signal()
+}
+
+// DiskUsage describes a mounted volume's capacity, in bytes.
+type DiskUsage struct {
+	Total int64
+	Free  int64
+	Used  int64
+}
+
+// Volume reports the capacity of the filesystem containing path, for the
+// "freed X of Y" progress bar.
+//
+// Free uses Bavail (blocks available to an unprivileged process) rather
+// than Bfree, which counts the root-only reserve as free and would
+// overstate what the user can actually use.
+func Volume(path string) (DiskUsage, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return DiskUsage{}, err
+	}
+	bs := int64(st.Bsize)
+	total := int64(st.Blocks) * bs
+	free := int64(st.Bavail) * bs
+	return DiskUsage{Total: total, Free: free, Used: total - free}, nil
 }

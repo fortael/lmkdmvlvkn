@@ -89,7 +89,7 @@ var (
 )
 
 const (
-	colMarker = 2
+	colMarker = 4 // cursor arrow + batch-selection checkbox
 	colType   = 7
 	colSize   = 9
 	colBar    = 18
@@ -173,6 +173,14 @@ func (m Model) render() string {
 		if contentH < 6 {
 			contentH = 6
 		}
+		if m.activeTab == tabResults {
+			b.WriteString(m.renderResults(m.width, contentH-cleanButtonHeight))
+			b.WriteString("\n")
+			b.WriteString(m.renderResultsButton(m.width))
+			b.WriteString("\n")
+			b.WriteString(m.renderHelp())
+			return appStyle.Render(b.String())
+		}
 		b.WriteString(m.renderPlaceholder(m.width, contentH))
 		b.WriteString("\n")
 		b.WriteString(m.renderHelp())
@@ -203,6 +211,11 @@ func (m Model) render() string {
 // still incomplete).
 func (m Model) tabLabel(t tab) string {
 	label := t.String()
+	if !m.tabBarFits() {
+		// Too many tabs for the terminal: drop the size summaries first,
+		// since the names are what make the bar navigable.
+		return label
+	}
 	if !t.browsable() {
 		return label
 	}
@@ -214,6 +227,28 @@ func (m Model) tabLabel(t tab) string {
 		label = fmt.Sprintf("%s (%s%s)", label, formatSize(total), suffix)
 	}
 	return label
+}
+
+// tabBarFits reports whether every tab label plus its size summary fits on
+// one line. With seven tabs the full labels overflow a normal terminal,
+// and an overflowing lipgloss row wraps and shoves the whole layout down,
+// so the summaries are dropped before that can happen.
+func (m Model) tabBarFits() bool {
+	width := 0
+	for t := tab(0); t < tabCount; t++ {
+		label := t.String()
+		if t.browsable() {
+			if total, complete := m.tabTotalSize(t); total > 0 {
+				suffix := "+"
+				if complete {
+					suffix = ""
+				}
+				label = fmt.Sprintf("%s (%s%s)", label, formatSize(total), suffix)
+			}
+		}
+		width += displayWidth(label) + 6 + 1 // Padding(1,3) each side, 1-col gap
+	}
+	return width <= m.width
 }
 
 // tabRegionsFor computes mouse hit-test rectangles for the tab bar. It only
@@ -255,6 +290,22 @@ func (m Model) renderBreadcrumb(width int) string {
 	return dimStyle.Render(truncate(text, width))
 }
 
+// emptyMessage explains an empty listing in the terms of whichever tab is
+// showing it, since "empty directory" is meaningless on the tabs whose
+// rows aren't directories at all.
+func (m Model) emptyMessage() string {
+	switch m.activeTab {
+	case tabLeftovers:
+		return "No leftovers — every folder here belongs to an app that is still installed."
+	case tabVendors:
+		return "No reinstallable dependency directories found under your home folder."
+	case tabDocker:
+		return "Docker has nothing to show."
+	default:
+		return "empty directory"
+	}
+}
+
 func (m Model) renderPlaceholder(width, height int) string {
 	box := boxStyle.Width(width - 2).Height(height - 2)
 	msg := fmt.Sprintf("%s — coming soon", m.activeTab.String())
@@ -279,8 +330,10 @@ func (m Model) renderTable(width, height int) string {
 		body = errorStyle.Render(f.loadErr)
 	} else if f != nil && f.loading && len(entries) == 0 {
 		body = dimStyle.Render("scanning…")
+	} else if len(entries) == 0 && m.activeTab == tabDocker && m.dockerReason != "" {
+		body = dimStyle.Render("Docker is not available: " + m.dockerReason)
 	} else if len(entries) == 0 {
-		body = dimStyle.Render("empty directory")
+		body = dimStyle.Render(m.emptyMessage())
 	} else {
 		visibleRows := innerH - 1
 		if visibleRows < 1 {
@@ -412,11 +465,20 @@ func (m Model) renderRow(e *scan.Entry, selected bool, nameW int, max int64, inn
 	}
 	gap := rowStyle.Render(" ")
 
-	marker := "  "
+	cursor := " "
 	if selected {
-		marker = "▸ "
+		cursor = "▸"
 	}
-	markerSeg := rowStyle.Render(padRight(marker, colMarker))
+	// The checkbox is only meaningful for rows that can actually be acted
+	// on; a blank keeps unresearched and protected rows visibly out of the
+	// batch flow rather than looking like an empty box you forgot to tick.
+	box := " "
+	if _, ok := m.selected[e.Path]; ok {
+		box = "✓"
+	} else if _, can := m.selectableStep(e); can {
+		box = "·"
+	}
+	markerSeg := rowStyle.Render(padRight(cursor+" "+box, colMarker))
 	typeSeg := rowStyle.Render(padRight(truncate(e.Source, colType), colType))
 
 	icon := "📄 "
@@ -432,6 +494,9 @@ func (m Model) renderRow(e *scan.Entry, selected bool, nameW int, max int64, inn
 	}
 	if k.Orphan {
 		name += "  ⚠ leftover"
+	}
+	if k.Protected {
+		name += "  🔒 protected"
 	}
 	nameSeg := rowStyle.Render(padRight(truncate(name, nameW), nameW))
 
@@ -629,6 +694,9 @@ func (m Model) buildMetaLines(e *scan.Entry, k knowledge.Entry, w int) []string 
 	if k.Orphan {
 		lines = append(lines, yellowStyle.Render(truncate("⚠ No installed app owns this", w)))
 	}
+	if k.Protected {
+		lines = append(lines, redStyle.Render(truncate("🔒 Protected — this app will not modify it", w)))
+	}
 	switch {
 	case k.Container:
 		for _, l := range wrapText("Enter to open — holds several version caches, see inside to clean them", w) {
@@ -772,6 +840,9 @@ const (
 	actionClean
 	actionNativeClean
 	actionManualDelete
+	actionRunBatch
+	actionSelectAll
+	actionClearHistory
 )
 
 type uiButton struct {
@@ -788,11 +859,54 @@ type uiButton struct {
 // your own risk" override, regardless of what (if anything) the knowledge
 // base says about it.
 func (m Model) cleanButtons() []uiButton {
+	// A queued batch outranks whatever the cursor happens to be on: the
+	// user built that list deliberately and the button carries the total
+	// they are about to free.
+	if len(m.selOrder) > 0 {
+		total, complete := m.selectionTotal()
+		approx := "~"
+		if complete {
+			approx = ""
+		}
+		btns := []uiButton{{
+			action: actionRunBatch,
+			label:  fmt.Sprintf("CLEAN %d SELECTED  (%s%s)  (c)", len(m.selOrder), approx, formatSize(total)),
+			style:  enabledButtonStyle,
+		}}
+		if m.activeTab.batchAll() {
+			btns = append(btns, uiButton{action: actionSelectAll, label: "SELECT ALL  (a)", style: nativeButtonStyle})
+		}
+		btns = append(btns, uiButton{label: "CLEAR SELECTION  (x)", style: disabledButtonStyle})
+		return btns
+	}
+
 	e := m.selectedEntry()
 	if e == nil {
+		if m.activeTab.batchAll() {
+			return []uiButton{{label: "NO LEFTOVERS FOUND  (nothing here belongs to an uninstalled app)", style: disabledButtonStyle}}
+		}
 		return []uiButton{{label: "CLEAN  (no folder selected)", style: disabledButtonStyle}}
 	}
+
+	// The Leftovers tab leads with "take the lot", since that is the
+	// entire reason to open it.
+	if m.activeTab.batchAll() {
+		return []uiButton{
+			{action: actionSelectAll, label: "SELECT ALL  (a)", style: enabledButtonStyle},
+			{action: actionManualDelete, label: "DELETE THIS ONE  (D)", style: dangerButtonStyle},
+		}
+	}
 	k := m.knowledgeFor(e)
+
+	// Protected storage gets no action row at all — not even the manual
+	// override, which is otherwise offered for everything. The button says
+	// why, so an empty row doesn't read as a bug.
+	if k.Protected {
+		return []uiButton{{
+			label: "PROTECTED  (managed by its own app — clean it from there)",
+			style: disabledButtonStyle,
+		}}
+	}
 
 	var btns []uiButton
 	switch {
@@ -894,26 +1008,21 @@ func (m Model) renderConfirm(width, height int) string {
 	if innerW < 20 {
 		innerW = 20
 	}
-	e := m.selectedEntry()
-	name := ""
-	if e != nil {
-		name = e.Name
-	}
 
 	borderColor := cYellow
-
 	var lines []string
+
 	switch m.mode {
 	case modeConfirmNative:
-		lines = append(lines, fmt.Sprintf("Run native clean for %q?", name))
+		lines = append(lines, fmt.Sprintf("Run native clean for %q?", m.confirmStep.name))
 		lines = append(lines, "")
-		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate(m.confirmNativeCmd, innerW-2)))
+		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate(m.confirmStep.command, innerW-2)))
 		lines = append(lines, "")
 		lines = append(lines, statusStyle.Render("[y] Yes, run it")+"    "+dimStyle.Render("[n/esc] Cancel"))
 
 	case modeConfirmManualDelete:
 		borderColor = cRed
-		lines = append(lines, redStyle.Render(fmt.Sprintf("Permanently delete the ENTIRE folder %q?", name)))
+		lines = append(lines, redStyle.Render(fmt.Sprintf("Permanently delete the ENTIRE folder %q?", m.confirmStep.name)))
 		lines = append(lines, "")
 		for _, l := range wrapText(
 			"This is the manual override — it bypasses the knowledge base entirely and removes the folder itself, "+
@@ -921,18 +1030,33 @@ func (m Model) renderConfirm(width, height int) string {
 			lines = append(lines, l)
 		}
 		lines = append(lines, "")
-		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate("rm -rf "+m.confirmPath, innerW-2)))
+		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate("rm -rf "+m.confirmStep.path, innerW-2)))
 		lines = append(lines, "")
 		lines = append(lines, redStyle.Render("[y] Yes, delete it permanently")+"    "+dimStyle.Render("[n/esc] Cancel"))
 
-	default:
-		lines = append(lines, fmt.Sprintf("Clean %q?", name))
+	case modeConfirmClearHistory:
+		borderColor = cRed
+		lines = append(lines, redStyle.Render("Clear the cleanup history?"))
 		lines = append(lines, "")
-		if len(m.confirmCleanPaths) == 0 {
+		for _, l := range wrapText(
+			"This deletes the log of what this app has removed. It frees no disk space of its own and does not "+
+				"restore anything — you simply lose the record, including the all-time total.", innerW) {
+			lines = append(lines, l)
+		}
+		lines = append(lines, "")
+		lines = append(lines, redStyle.Render("[y] Yes, clear it")+"    "+dimStyle.Render("[n/esc] Cancel"))
+
+	case modeConfirmBatch:
+		lines = m.batchConfirmLines(innerW)
+
+	default:
+		lines = append(lines, fmt.Sprintf("Clean %q?", m.confirmStep.name))
+		lines = append(lines, "")
+		if len(m.confirmStep.cleanPaths) == 0 {
 			lines = append(lines, "This removes everything inside the folder (not the folder itself):")
-			lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate("rm -rf "+m.confirmPath+"/*", innerW-2)))
+			lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate("rm -rf "+m.confirmStep.path+"/*", innerW-2)))
 		} else {
-			info, ready := m.reclaimCache[m.confirmPath]
+			info, ready := m.reclaimCache[m.confirmStep.path]
 			ready = ready && info.ready
 			if ready {
 				lines = append(lines, fmt.Sprintf(
@@ -941,8 +1065,8 @@ func (m Model) renderConfirm(width, height int) string {
 			} else {
 				lines = append(lines, "This only removes the specific cache paths below — the rest of the folder is left alone:")
 			}
-			for _, pat := range m.confirmCleanPaths {
-				cmd := "rm -rf " + filepath.Join(m.confirmPath, pat)
+			for _, pat := range m.confirmStep.cleanPaths {
+				cmd := "rm -rf " + filepath.Join(m.confirmStep.path, pat)
 				sizeSuffix := ""
 				if ready {
 					if sz, ok := info.perPath[pat]; ok {
@@ -960,9 +1084,66 @@ func (m Model) renderConfirm(width, height int) string {
 		lines = append(lines, statusStyle.Render("[y] Yes, clean it")+"    "+dimStyle.Render("[n/esc] Cancel"))
 	}
 
-	msg := strings.Join(lines, "\n")
+	// The batch list can be long; scroll it rather than overflowing the
+	// panel, which would push the rest of the screen out of alignment.
+	window := scrollWindow(lines, m.detailScroll, innerH)
+	msg := strings.Join(window, "\n")
+	if m.mode == modeConfirmBatch {
+		return boxStyle.Width(width - 2).Height(innerH).BorderForeground(lipgloss.Color(borderColor)).Render(msg)
+	}
 	return boxStyle.Width(width - 2).Height(innerH).BorderForeground(lipgloss.Color(borderColor)).
-		Render(lipgloss.Place(width-4, innerH, lipgloss.Center, lipgloss.Center, msg))
+		Render(lipgloss.Place(width-4, innerH, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n")))
+}
+
+// batchConfirmLines itemises the queued batch: every step, in the order it
+// will run, with the action that will be used and what it should free.
+// The whole point of the batch flow is reviewing once instead of many
+// times, so this shows the full list rather than a count.
+func (m Model) batchConfirmLines(w int) []string {
+	steps := m.orderedSteps()
+	total, complete := m.selectionTotal()
+	approx := "~"
+	if complete {
+		approx = ""
+	}
+
+	var lines []string
+	lines = append(lines, boldStyle.Render(fmt.Sprintf("Run %d cleanup steps, freeing about %s%s?",
+		len(steps), approx, formatSize(total))))
+	lines = append(lines, "")
+	for _, l := range wrapText("They run one at a time, in this order. A step that fails does not stop the rest; "+
+		"anything that goes wrong is reported at the end.", w) {
+		lines = append(lines, dimStyle.Render(l))
+	}
+	lines = append(lines, "")
+
+	for i, s := range steps {
+		size := "?"
+		if s.estimateReady {
+			size = formatSize(s.estimate)
+		}
+		label := fmt.Sprintf("%2d. [%s] %s", i+1, s.action, s.name)
+		suffix := "  " + size
+		line := truncate(label, w-displayWidth(suffix)) + faintStyle.Render(suffix)
+		lines = append(lines, line)
+
+		detail := "rm -rf " + s.path
+		switch s.action {
+		case batchNative:
+			detail = s.command
+		case batchClean:
+			if len(s.cleanPaths) > 0 {
+				detail = "rm -rf " + s.path + "/{" + strings.Join(s.cleanPaths, ",") + "}"
+			} else {
+				detail = "rm -rf " + s.path + "/*"
+			}
+		}
+		lines = append(lines, "    "+faintStyle.Render(truncate(detail, w-4)))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, statusStyle.Render("[y] Yes, run all")+"    "+dimStyle.Render("[n/esc] Cancel"))
+	return lines
 }
 
 func (m Model) renderHelp() string {
@@ -973,10 +1154,17 @@ func (m Model) renderHelp() string {
 		return helpStyle.Render("confirm the native clean above")
 	case modeConfirmManualDelete:
 		return redStyle.Render("confirm the permanent delete above")
+	case modeConfirmBatch:
+		return helpStyle.Render("confirm the batch above   PgUp/PgDn scroll the list")
+	case modeConfirmClearHistory:
+		return redStyle.Render("confirm clearing the history above")
 	}
-	left := "↑/↓ select   Enter open   d clean   n native clean   D delete   Esc/⌫ back   PgUp/PgDn scroll   " +
-		"click headers to sort   tab switch   r rescan   q quit"
-	if !m.activeTab.browsable() {
+	left := "↑/↓ move   space select   c run batch   a select all   x clear   Enter open   d clean   n native   " +
+		"D delete   Esc/⌫ back   PgUp/PgDn scroll   tab switch   r rescan   q quit"
+	switch {
+	case m.activeTab == tabResults:
+		left = "PgUp/PgDn scroll   c clear history   tab switch tabs   q quit"
+	case !m.activeTab.browsable():
 		left = "tab switch tabs   q quit"
 	}
 	if m.statusMsg != "" {

@@ -37,6 +37,11 @@ const (
 	RootHome Root = "Home"
 	// RootApplications covers installed .app bundles and their contents.
 	RootApplications Root = "Applications"
+	// RootDocker and RootVendors have no name-keyed dictionary: their rows
+	// are described by the scanners that discover them, looked up by path
+	// rather than by folder name.
+	RootDocker  Root = "Docker"
+	RootVendors Root = "Vendors"
 )
 
 // Score is a 0-3 safety rating for deleting a folder.
@@ -95,6 +100,64 @@ type Entry struct {
 	// the description, but deliberately does not change Score or unlock a
 	// clean action the entry didn't already have.
 	Orphan bool
+	// Protected marks storage this app refuses to touch at all — not even
+	// through the manual-delete override that is otherwise always
+	// available. Set by Protect, never by hand. See protectedPathRe for
+	// what qualifies and why.
+	Protected bool
+}
+
+// CanDelete reports whether the manual-delete override should be offered.
+// It is true for almost everything, including folders the dictionary knows
+// nothing about: the override exists precisely so the user isn't limited
+// to what has been researched. Protected storage is the one exception.
+func (e Entry) CanDelete() bool {
+	return !e.Protected
+}
+
+// protectedPathRe matches storage owned by an application that has to be
+// the only thing managing it.
+//
+// OrbStack is the motivating case. Its group container holds a single
+// sparse disk image containing every Docker image, container and volume,
+// plus a running Linux VM's state. Deleting any part of it from underneath
+// a live VM corrupts the lot, and even a clean removal silently destroys
+// work the user has no other copy of. There is nothing this app can offer
+// there that OrbStack's own interface doesn't do better and more safely,
+// so the folder is shown and explained but never acted on — including
+// anything nested inside it, since drilling in would otherwise reach
+// data.img.raw directly.
+//
+// dev.kdrag0n.MacVirt is the same application: MacVirt is the bundle
+// identifier OrbStack ships under.
+var protectedPathRe = regexp.MustCompile(
+	`(?i)(^|/)([^/]*\.)?dev\.orbstack(/|$)|(^|/)dev\.kdrag0n\.MacVirt(/|$)|(^|/)OrbStack\.app(/|$)`,
+)
+
+// protectedNote is appended to a protected entry's description so the row
+// explains why it offers nothing rather than looking broken.
+const protectedNote = " This app deliberately offers no action here — not cleaning, and not the manual delete " +
+	"override either. Everything in this folder is managed by OrbStack itself, and removing any of it from " +
+	"outside the app risks destroying every Docker image, container and volume on the machine. Use OrbStack's " +
+	"own interface, or `docker system prune`, to reclaim this space safely."
+
+// Protect marks entries the app refuses to act on, based on the full path
+// rather than the folder name so that everything nested inside protected
+// storage is covered too. It strips any clean action the dictionary
+// defined, so protection can't be bypassed by an entry that predates it.
+func Protect(e Entry, path string) Entry {
+	if !protectedPathRe.MatchString(path) {
+		return e
+	}
+	e.Protected = true
+	e.Commands = nil
+	e.CleanPaths = nil
+	e.Native = nil
+	if e.Description == "" {
+		e.Description = "Storage belonging to OrbStack's Linux VM."
+	}
+	e.Description += protectedNote
+	return e
 }
 
 // NativeClean describes a tool-provided cleanup command as an alternative
@@ -109,7 +172,7 @@ type NativeClean struct {
 
 // CanClean reports whether the UI should offer a clean action for e.
 func (e Entry) CanClean() bool {
-	return !e.Container && e.Score >= Risky && len(e.Commands) > 0
+	return !e.Protected && !e.Container && e.Score >= Risky && len(e.Commands) > 0
 }
 
 // RootSpec describes one scanned top-level directory: where it lives and
@@ -183,12 +246,26 @@ func HomeItems() []HomeItem {
 // db is the per-root dictionary. Each root's table lives in its own file
 // (caches.go, appsupport.go, ...) so the curated prose stays browsable.
 var db = map[Root]map[string]Entry{
-	RootCaches:          cachesDB,
-	RootAppSupport:      appSupportDB,
+	RootCaches:          mergeTables(cachesDB, ideCachesDB),
+	RootAppSupport:      mergeTables(appSupportDB, ideAppSupportDB),
 	RootGroupContainers: groupContainersDB,
 	RootLogs:            logsDB,
 	RootContainers:      containersDB,
 	RootApplications:    applicationsDB,
+}
+
+// mergeTables combines dictionary files into one root's table. Editor and
+// IDE entries live in their own file because there are a lot of them and
+// they read as a set; keys must not collide, which
+// TestNoDuplicateDictionaryKeys enforces.
+func mergeTables(tables ...map[string]Entry) map[string]Entry {
+	out := make(map[string]Entry)
+	for _, t := range tables {
+		for k, v := range t {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // patterns are per-root regexp fallbacks for folders whose name varies,
@@ -280,7 +357,7 @@ type patternEntry struct {
 // product name, year, and minor version separately for comparison. The
 // same naming scheme is used under Caches, Application Support and Logs.
 var jetbrainsVersionRe = regexp.MustCompile(
-	`^(GoLand|IntelliJIdea|WebStorm|PyCharm|PhpStorm|CLion|Rider|DataGrip|RubyMine|AppCode|AndroidStudio|RustRover|Fleet)(\d{4})\.(\d+)$`,
+	`^(GoLand|IntelliJIdea|IdeaIC|WebStorm|PyCharm|PyCharmCE|PhpStorm|CLion|Rider|DataGrip|DataSpell|RubyMine|AppCode|AndroidStudio|RustRover|Aqua|Writerside|MPS|Fleet)(\d{4})\.(\d+)$`,
 )
 
 // parseJetBrainsVersion splits a per-version JetBrains folder name into

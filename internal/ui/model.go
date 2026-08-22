@@ -4,27 +4,32 @@ package ui
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"lmkdmvlvkn/internal/history"
 	"lmkdmvlvkn/internal/knowledge"
 	"lmkdmvlvkn/internal/scan"
 )
 
 type tab int
 
+// Tab order runs cleanup-first: the three tabs that free the most space
+// come before the ones that mostly inform, and Results is last because
+// it's a record of work already done.
 const (
 	tabSystemData tab = iota
-	tabDocker
+	tabLeftovers
 	tabHome
+	tabVendors
 	tabApplications
+	tabDocker
+	tabResults
 	tabCount
 )
 
@@ -32,23 +37,41 @@ func (t tab) String() string {
 	switch t {
 	case tabSystemData:
 		return "System Data"
-	case tabDocker:
-		return "Docker"
+	case tabLeftovers:
+		return "Leftovers"
 	case tabHome:
 		return "Home"
+	case tabVendors:
+		return "Vendors"
 	case tabApplications:
 		return "Applications"
+	case tabDocker:
+		return "Docker"
+	case tabResults:
+		return "Results"
 	default:
 		return "?"
 	}
 }
 
 // browsable reports whether a tab shows the folder table (and therefore
-// supports selection, cleaning and drilling in) rather than a placeholder.
-// Docker is handled by a dedicated implementation and stays a placeholder
-// until that lands.
+// supports selection, cleaning and drilling in) rather than rendering
+// something of its own.
 func (t tab) browsable() bool {
-	return t == tabSystemData || t == tabHome || t == tabApplications
+	switch t {
+	case tabSystemData, tabLeftovers, tabHome, tabVendors, tabApplications, tabDocker:
+		return true
+	default:
+		return false
+	}
+}
+
+// batchAll reports whether a tab offers "act on everything here at once".
+// It's the whole point of Leftovers — a pile of folders belonging to apps
+// that are already gone — and would be reckless anywhere the rows are
+// things the user still uses.
+func (t tab) batchAll() bool {
+	return t == tabLeftovers
 }
 
 type mode int
@@ -58,6 +81,8 @@ const (
 	modeConfirmClean
 	modeConfirmNative
 	modeConfirmManualDelete
+	modeConfirmBatch
+	modeConfirmClearHistory
 )
 
 // sortColumn selects which field the table is ordered by. sortDefault is
@@ -96,13 +121,26 @@ type navFrame struct {
 	source   string
 	entries  []*scan.Entry
 	selected string
-	loading  bool
+	// pinned keeps the selection on the first row while sizes stream in.
+	// Rows are measured in the background and the table re-sorts as each
+	// result lands, so a selection fixed to one entry drifts down the list
+	// as bigger folders overtake it — dragging the viewport, which follows
+	// the selection, into the middle of the table. The user lands on the
+	// largest item instead; the first deliberate move clears this.
+	pinned  bool
+	loading bool
 	// pending counts listings still in flight for a synthetic frame that
 	// merges several sources; loading clears when it reaches zero.
 	pending int
 	loadErr string // scoped to this frame, so an error in a subdirectory
 	// doesn't linger on screen after navigating back up to one that
 	// loaded fine
+	// scores caches each entry's safety rating. Ratings depend only on the
+	// entry set, never on the sizes that stream in afterwards, so they are
+	// computed once per listing rather than on every one of the thousand-
+	// odd size results — which otherwise meant well over a million regexp
+	// lookups for a single scan.
+	scores map[*scan.Entry]knowledge.Score
 }
 
 // removeEntry drops the entry at path from the frame, if present, and
@@ -121,6 +159,7 @@ func (f *navFrame) removeEntry(path string) {
 		return
 	}
 	f.entries = append(f.entries[:idx], f.entries[idx+1:]...)
+	f.scores = nil // the entry set changed; sibling context may have too
 	if f.selected != path {
 		return
 	}
@@ -159,11 +198,15 @@ type Model struct {
 	sortCol sortColumn
 	sortAsc bool
 
-	// homeDB maps a Home-tab item's absolute path to its dictionary entry.
-	// The Home tab is curated by path rather than discovered by name, so
-	// its lookups can't go through the name-keyed dictionary the other
-	// tabs use.
-	homeDB map[string]knowledge.Entry
+	// pathDB maps a row's path to its dictionary entry, for the tabs whose
+	// rows are identified by path rather than by folder name: the curated
+	// Home list, Docker objects, and discovered vendor directories. Those
+	// can't go through the name-keyed dictionary the Library tabs use.
+	pathDB map[string]knowledge.Entry
+
+	// dockerReason explains why the Docker tab is empty when the daemon
+	// isn't reachable.
+	dockerReason string
 
 	// appIndex backs orphan detection. It shells out to `defaults read`
 	// once per installed app, so it's built in the background and is
@@ -176,31 +219,59 @@ type Model struct {
 	// (see maybeComputeReclaim) since it requires walking the filesystem.
 	reclaimCache map[string]reclaimInfo
 
+	// selected is the batch-clean set, keyed by path, and selOrder is the
+	// order the user ticked them in. Both are needed: the map answers "is
+	// this row selected" while rendering, and the slice preserves the
+	// top-to-bottom order the steps were promised to run in.
+	selected map[string]batchStep
+	selOrder []string
+
+	// batch is the state of a running or just-finished batch, and batchCh
+	// streams progress from the worker goroutine.
+	batch   batchResult
+	batchCh chan batchProgressMsg
+
+	// history is the persisted record of past deletions, loaded once at
+	// startup and appended to as the app cleans.
+	history      []history.Record
+	historyErr   string
+	historyTotal int64
+	disk         scan.DiskUsage
+
 	scanner *scan.Scanner
 
 	cleaning     bool
 	spinnerFrame int
 	statusMsg    string
 
-	confirmPath       string
-	confirmCleanPaths []string
-
-	confirmNativeCmd   string
-	confirmNativeLabel string
+	// confirmStep is the single action awaiting y/n confirmation.
+	confirmStep batchStep
 }
 
 // New builds the model with a landing frame for each browsable tab.
 func New() Model {
 	m := Model{
-		scanner:      scan.NewScanner(2),
+		// Four workers rather than a token pair: the five Library roots
+		// list well over a thousand entries between them, and ~/Library/
+		// Containers alone contributes hundreds of small folders that are
+		// pure latency to walk one at a time.
+		scanner:      scan.NewScanner(4),
 		reclaimCache: make(map[string]reclaimInfo),
-		homeDB:       make(map[string]knowledge.Entry),
+		pathDB:       make(map[string]knowledge.Entry),
+		selected:     make(map[string]batchStep),
 	}
+
+	m.navs[tabLeftovers] = []navFrame{{
+		id:    m.newFrameID(),
+		label: "Leftovers",
+		root:  knowledge.RootCaches,
+	}}
 
 	m.navs[tabSystemData] = []navFrame{{
 		id:      m.newFrameID(),
 		label:   "System Data",
 		root:    knowledge.RootCaches,
+		pinned:  true,
 		loading: true,
 		pending: len(knowledge.SystemDataRoots()),
 	}}
@@ -210,6 +281,25 @@ func New() Model {
 		label:   "Applications",
 		root:    knowledge.RootApplications,
 		source:  "App",
+		pinned:  true,
+		loading: true,
+		pending: 1,
+	}}
+
+	m.navs[tabVendors] = []navFrame{{
+		id:      m.newFrameID(),
+		label:   "Vendors",
+		root:    knowledge.RootVendors,
+		pinned:  true,
+		loading: true,
+		pending: 1,
+	}}
+
+	m.navs[tabDocker] = []navFrame{{
+		id:      m.newFrameID(),
+		label:   "Docker",
+		root:    knowledge.RootDocker,
+		pinned:  true,
 		loading: true,
 		pending: 1,
 	}}
@@ -245,7 +335,7 @@ func (m *Model) buildHomeFrame() navFrame {
 		if err != nil {
 			continue
 		}
-		m.homeDB[path] = it.Entry
+		m.pathDB[path] = it.Entry
 		entries = append(entries, &scan.Entry{
 			Name:    name,
 			Path:    path,
@@ -261,6 +351,7 @@ func (m *Model) buildHomeFrame() navFrame {
 		label:   "Home",
 		root:    knowledge.RootHome,
 		source:  "Home",
+		pinned:  true,
 		entries: entries,
 	}
 	if len(entries) > 0 {
@@ -270,13 +361,13 @@ func (m *Model) buildHomeFrame() navFrame {
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{waitForSizeCmd(m.scanner.Results), indexAppsCmd()}
+	cmds := []tea.Cmd{waitForSizeCmd(m.scanner.Results), indexAppsCmd(), loadHistoryCmd()}
 
 	sysID := m.navs[tabSystemData][0].id
 	for _, r := range knowledge.SystemDataRoots() {
 		cmds = append(cmds, loadDirCmd(sysID, r.Path, r.Label, string(r.Root)))
 	}
-	cmds = append(cmds, loadAppsCmd(m.navs[tabApplications][0].id))
+	cmds = append(cmds, loadAppsCmd(m.navs[tabApplications][0].id), loadDockerCmd(), loadVendorsCmd())
 
 	for _, e := range m.navs[tabHome][0].entries {
 		m.scanner.Enqueue(e.Path)
@@ -327,6 +418,34 @@ func indexAppsCmd() tea.Cmd {
 	}
 }
 
+type historyLoadedMsg struct {
+	records []history.Record
+	disk    scan.DiskUsage
+	err     error
+}
+
+// loadHistoryCmd reads the persisted deletion log and the volume's
+// capacity, both of which back the Results tab.
+func loadHistoryCmd() tea.Cmd {
+	return func() tea.Msg {
+		recs, err := history.Load()
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			home = "/"
+		}
+		disk, _ := scan.Volume(home)
+		return historyLoadedMsg{records: recs, disk: disk, err: err}
+	}
+}
+
+type historyClearedMsg struct{ err error }
+
+func clearHistoryCmd() tea.Cmd {
+	return func() tea.Msg {
+		return historyClearedMsg{err: history.Clear()}
+	}
+}
+
 type sizeResultMsg scan.SizeResult
 
 func waitForSizeCmd(results <-chan scan.SizeResult) tea.Cmd {
@@ -339,20 +458,22 @@ func waitForSizeCmd(results <-chan scan.SizeResult) tea.Cmd {
 	}
 }
 
-type cleanDoneMsg struct {
-	path string
-	err  error
+// stepDoneMsg reports a single-item clean/native/delete finishing.
+type stepDoneMsg struct {
+	path   string
+	name   string
+	action batchAction
+	freed  int64
+	err    error
 }
 
-// cleanCmd removes dir's contents. If relPatterns is empty, every direct
-// child of dir is removed (the common case). Otherwise only files/dirs
-// matching those glob patterns (relative to dir) are removed, leaving the
-// rest of dir untouched — used where wiping the whole folder would be too
-// broad (e.g. a JetBrains IDE version still in use).
-func cleanCmd(path string, relPatterns []string) tea.Cmd {
+// runStepCmd performs one removal in the background. Single-item actions
+// go through exactly the same runStep as a batch, so what gets measured
+// and what gets written to the history log can't diverge between them.
+func runStepCmd(s batchStep) tea.Cmd {
 	return func() tea.Msg {
-		err := cleanDir(path, relPatterns)
-		return cleanDoneMsg{path: path, err: err}
+		freed, err := runStep(s)
+		return stepDoneMsg{path: s.path, name: s.name, action: s.action, freed: freed, err: err}
 	}
 }
 
@@ -402,58 +523,6 @@ func cleanAllChildren(dir string) error {
 		}
 	}
 	return firstErr
-}
-
-type manualDeleteDoneMsg struct {
-	path string
-	err  error
-}
-
-// manualDeleteCmd removes path entirely — the folder itself, not just its
-// contents. Unlike cleanCmd, this bypasses the knowledge base completely:
-// it's the always-available manual override for when the user wants to
-// delete something we haven't researched (or wants to go further than a
-// researched entry's own Commands/CleanPaths would), entirely at their own
-// risk.
-func manualDeleteCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		return manualDeleteDoneMsg{path: path, err: os.RemoveAll(path)}
-	}
-}
-
-type nativeCleanDoneMsg struct {
-	path    string
-	err     error
-	summary string // last non-blank line of output, for a one-line status
-}
-
-// nativeCleanCmd runs command (one of the fixed, hand-written strings in
-// the knowledge base — never user input) via the shell, with dir as its
-// working directory.
-//
-// Setsid detaches the child into its own session so it has no controlling
-// terminal. Some tools (Homebrew's Ruby-based cleanup among them) open
-// /dev/tty directly for progress output when they detect an interactive
-// terminal, which bypasses CombinedOutput's pipe entirely and writes
-// straight into our alt-screen buffer — corrupting it in a way Bubble Tea
-// has no way to know about or repaint over. Without a controlling
-// terminal, that /dev/tty open fails and the tool falls back to plain
-// stdout, which we do capture.
-func nativeCleanCmd(dir, command string) tea.Cmd {
-	return func() tea.Msg {
-		cmd := exec.Command("sh", "-c", command)
-		// A native command's working directory only makes sense if it is
-		// one; entries whose target is a file (or has vanished) still run
-		// fine from the parent.
-		if info, err := os.Lstat(dir); err == nil && !info.IsDir() {
-			cmd.Dir = filepath.Dir(dir)
-		} else {
-			cmd.Dir = dir
-		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		out, err := cmd.CombinedOutput()
-		return nativeCleanDoneMsg{path: dir, err: err, summary: lastLine(string(out))}
-	}
 }
 
 // lastLine returns the last non-blank line of s, for compressing a
@@ -565,9 +634,78 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		m.spinnerFrame++
 		return m, spinnerTickCmd()
 
+	case dockerLoadedMsg:
+		f := &m.navs[tabDocker][0]
+		f.loading = false
+		f.pending = 0
+		f.scores = nil
+		m.dockerReason = msg.reason
+		switch {
+		case !msg.available:
+			f.entries = nil
+			f.loadErr = ""
+		case msg.err != nil:
+			f.loadErr = msg.err.Error()
+		default:
+			f.loadErr = ""
+			f.entries = m.dockerEntries(msg.items)
+			m.sortFrame(f)
+			if len(f.entries) > 0 {
+				f.selected = f.entries[0].Path
+			}
+		}
+		return m, nil
+
+	case vendorsLoadedMsg:
+		f := &m.navs[tabVendors][0]
+		f.loading = false
+		f.pending = 0
+		f.scores = nil
+		if msg.err != nil {
+			f.loadErr = msg.err.Error()
+			return m, nil
+		}
+		f.loadErr = ""
+		f.entries = m.vendorEntries(msg.items)
+		m.sortFrame(f)
+		if len(f.entries) > 0 {
+			f.selected = f.entries[0].Path
+		}
+		for _, e := range f.entries {
+			m.scanner.Enqueue(e.Path)
+		}
+		return m, nil
+
 	case appIndexMsg:
 		m.appIndex = knowledge.AppIndex(msg)
+		// Orphan status is what the Leftovers tab is made of, and it only
+		// becomes knowable once the installed-app index lands.
+		m.rebuildLeftovers()
 		return m, nil
+
+	case historyLoadedMsg:
+		m.history = msg.records
+		m.historyTotal = history.TotalFreed(msg.records)
+		m.disk = msg.disk
+		if msg.err != nil {
+			m.historyErr = msg.err.Error()
+		}
+		return m, nil
+
+	case historyClearedMsg:
+		m.mode = modeNormal
+		if msg.err != nil {
+			m.statusMsg = "could not clear history: " + msg.err.Error()
+			return m, nil
+		}
+		m.history = nil
+		m.historyTotal = 0
+		m.historyErr = ""
+		m.statusMsg = "history cleared"
+		return m, nil
+
+	case batchProgressMsg:
+		return m.handleBatchProgress(msg)
 
 	case reclaimSizeMsg:
 		if m.reclaimCache == nil {
@@ -599,12 +737,18 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		f.loadErr = ""
 		f.entries = append(f.entries, msg.entries...)
+		f.scores = nil // new rows change the sibling context of existing ones
 		m.sortFrame(f)
 		if f.selected == "" && len(f.entries) > 0 {
 			f.selected = f.entries[0].Path
 		}
 		for _, e := range msg.entries {
 			m.scanner.Enqueue(e.Path)
+		}
+		// The Leftovers tab is a filtered view of this listing, so it has
+		// to be refreshed whenever the listing grows.
+		if len(m.navs[tabSystemData]) > 0 && m.navs[tabSystemData][0].id == msg.frameID {
+			m.rebuildLeftovers()
 		}
 		return m, nil
 
@@ -631,48 +775,151 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, waitForSizeCmd(m.scanner.Results)
 
-	case cleanDoneMsg:
-		m.cleaning = false
-		m.mode = modeNormal
-		if msg.err != nil {
-			m.statusMsg = "clean failed: " + msg.err.Error()
-		} else {
-			m.statusMsg = "cleaned " + filepath.Base(msg.path)
-		}
-		m.invalidateSize(msg.path)
-		return m, nil
-
-	case nativeCleanDoneMsg:
+	case stepDoneMsg:
 		m.cleaning = false
 		m.mode = modeNormal
 		switch {
 		case msg.err != nil:
-			m.statusMsg = "native clean failed: " + msg.err.Error()
-		case msg.summary != "":
-			m.statusMsg = "native clean done: " + msg.summary
+			m.statusMsg = msg.action.String() + " failed: " + msg.err.Error()
+		case msg.freed > 0:
+			m.statusMsg = msg.action.String() + "ed " + msg.name + ", freed " + formatSize(msg.freed)
 		default:
-			m.statusMsg = "native clean done"
+			m.statusMsg = msg.action.String() + "ed " + msg.name
 		}
-		m.invalidateSize(msg.path)
-		return m, nil
 
-	case manualDeleteDoneMsg:
-		m.cleaning = false
-		m.mode = modeNormal
-		if msg.err != nil {
-			m.statusMsg = "delete failed: " + msg.err.Error()
-			return m, nil
-		}
-		m.statusMsg = "deleted " + filepath.Base(msg.path)
-		delete(m.reclaimCache, msg.path)
-		for ti := range m.navs {
-			for fi := range m.navs[ti] {
-				m.navs[ti][fi].removeEntry(msg.path)
+		// A delete removes the thing itself, so its row goes; a clean
+		// empties a folder that still exists, so the row stays and is
+		// re-measured.
+		if msg.action == batchDelete && msg.err == nil {
+			delete(m.reclaimCache, msg.path)
+			for ti := range m.navs {
+				for fi := range m.navs[ti] {
+					m.navs[ti][fi].removeEntry(msg.path)
+				}
 			}
+		} else {
+			m.invalidateSize(msg.path)
 		}
-		return m, nil
+		m.deselect(msg.path)
+		m.rebuildLeftovers()
+		return m, loadHistoryCmd()
 	}
 	return m, nil
+}
+
+// handleBatchProgress folds one finished step into the running summary,
+// records it in the persistent history, and re-arms the listener.
+func (m Model) handleBatchProgress(msg batchProgressMsg) (Model, tea.Cmd) {
+	if msg.done {
+		m.cleaning = false
+		m.batch.running = false
+		m.clearSelection()
+		switch {
+		case len(m.batch.failures) == 0:
+			m.statusMsg = "cleaned " + strconv.Itoa(m.batch.completed) + " items, freed " + formatSize(m.batch.freed)
+		default:
+			m.statusMsg = "cleaned " + strconv.Itoa(m.batch.completed) + " items, freed " +
+				formatSize(m.batch.freed) + "; " + strconv.Itoa(len(m.batch.failures)) + " failed"
+		}
+		m.rebuildLeftovers()
+		return m, loadHistoryCmd()
+	}
+
+	m.batch.index = msg.index + 1
+	m.batch.total = msg.total
+	m.batch.current = msg.name
+	if msg.err != nil {
+		m.batch.failures = append(m.batch.failures, msg.name+": "+msg.err.Error())
+	} else {
+		m.batch.completed++
+		m.batch.freed += msg.freed
+	}
+	m.invalidateSize(m.stepPath(msg.index))
+	return m, waitForBatchCmd(m.batchCh)
+}
+
+// stepPath recovers the path of the step at index, so a finished step can
+// have its row re-measured. The order slice is cleared when the batch
+// ends, so this is only ever called mid-run.
+func (m Model) stepPath(index int) string {
+	if index < 0 || index >= len(m.selOrder) {
+		return ""
+	}
+	return m.selOrder[index]
+}
+
+// clearSelection empties the batch set.
+func (m *Model) clearSelection() {
+	m.selected = make(map[string]batchStep)
+	m.selOrder = nil
+}
+
+// selectionTotal sums what the current selection is expected to free, and
+// reports whether every step's estimate is known yet — granular cleans
+// need a background measurement first, and reporting a partial sum as if
+// it were final would understate the result.
+func (m Model) selectionTotal() (total int64, complete bool) {
+	complete = true
+	for _, p := range m.selOrder {
+		s, ok := m.selected[p]
+		if !ok {
+			continue
+		}
+		if !s.estimateReady {
+			complete = false
+			continue
+		}
+		total += s.estimate
+	}
+	return total, complete
+}
+
+// orderedSteps materialises the batch in the order the user built it.
+func (m Model) orderedSteps() []batchStep {
+	steps := make([]batchStep, 0, len(m.selOrder))
+	for _, p := range m.selOrder {
+		if s, ok := m.selected[p]; ok {
+			steps = append(steps, s)
+		}
+	}
+	return steps
+}
+
+// rebuildLeftovers refreshes the Leftovers tab from the System Data scan.
+//
+// It reuses the very same *scan.Entry pointers rather than copying them,
+// so sizes measured for the main table show up here for free and a row
+// can never disagree with itself across two tabs.
+func (m *Model) rebuildLeftovers() {
+	src := m.navs[tabSystemData]
+	if len(src) == 0 {
+		return
+	}
+	all := src[0].entries
+	var entries []*scan.Entry
+	for _, e := range all {
+		if m.knowledgeIn(all, e).Orphan {
+			entries = append(entries, e)
+		}
+	}
+
+	f := &m.navs[tabLeftovers][0]
+	prev := f.selected
+	f.entries = entries
+	f.scores = nil
+	f.loading = src[0].loading
+	// Keep the cursor where it was if that row is still a leftover.
+	f.selected = ""
+	for _, e := range entries {
+		if e.Path == prev {
+			f.selected = prev
+			break
+		}
+	}
+	m.sortFrame(f)
+	if f.selected == "" && len(entries) > 0 {
+		f.selected = entries[0].Path
+	}
 }
 
 // invalidateSize marks path's cached size stale everywhere it appears and
@@ -715,12 +962,21 @@ func (m Model) View() string {
 // sortFrame orders one frame's entries by the active sort column, scoring
 // each entry through the model so Home's path-keyed entries and orphan
 // annotations are accounted for the same way the table renders them.
+//
+// Scores are cached on the frame: this runs once per size result — over a
+// thousand times during a full scan — while the ratings themselves depend
+// only on the entry set.
 func (m Model) sortFrame(f *navFrame) {
-	scoreOf := make(map[*scan.Entry]knowledge.Score, len(f.entries))
-	for _, e := range f.entries {
-		scoreOf[e] = m.knowledgeIn(f.entries, e).Score
+	if f.scores == nil {
+		f.scores = make(map[*scan.Entry]knowledge.Score, len(f.entries))
+		for _, e := range f.entries {
+			f.scores[e] = m.knowledgeIn(f.entries, e).Score
+		}
 	}
-	sortEntries(f.entries, m.sortCol, m.sortAsc, scoreOf)
+	sortEntries(f.entries, m.sortCol, m.sortAsc, f.scores)
+	if f.pinned && len(f.entries) > 0 {
+		f.selected = f.entries[0].Path
+	}
 }
 
 // sortEntries orders entries by col/asc, using precomputed scores.
@@ -849,8 +1105,8 @@ func (m Model) knowledgeFor(e *scan.Entry) knowledge.Entry {
 // version-supersede rule compares folder names, so letting a Logs entry
 // count as a sibling of a Caches entry would compare unrelated things.
 func (m Model) knowledgeIn(all []*scan.Entry, e *scan.Entry) knowledge.Entry {
-	if k, ok := m.homeDB[e.Path]; ok {
-		return k
+	if k, ok := m.pathDB[e.Path]; ok {
+		return knowledge.Protect(k, e.Path)
 	}
 	siblings := make([]string, 0, len(all))
 	for _, s := range all {
@@ -859,7 +1115,8 @@ func (m Model) knowledgeIn(all []*scan.Entry, e *scan.Entry) knowledge.Entry {
 		}
 	}
 	k := knowledge.Effective(knowledge.Root(e.Root), e.Name, siblings)
-	return knowledge.AnnotateOrphan(k, e.Name, m.appIndex)
+	k = knowledge.AnnotateOrphan(k, knowledge.Root(e.Root), e.Name, m.appIndex)
+	return knowledge.Protect(k, e.Path)
 }
 
 // tabTotalSize sums the known sizes of a tab's landing listing, for the

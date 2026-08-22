@@ -88,6 +88,22 @@ var homeItems = []HomeItem{
 				`# to drop single models instead: ollama list, then ollama rm <model>`,
 			},
 			CleanPaths: []string{"models/blobs/*", "models/manifests/*"},
+			// Ollama ships no bulk prune: `ollama rm` takes model names and
+			// nothing else, so the native path has to enumerate them first.
+			// Piping `ollama list` into `ollama rm` lets Ollama do its own
+			// reference counting — a blob shared by two models survives
+			// until the last model referencing it is gone — which a plain
+			// rm -rf of blobs/ cannot do. NR>1 drops the NAME/ID/SIZE header
+			// row, and the read loop is used instead of xargs because BSD
+			// xargs still runs the command once when its input is empty.
+			Native: &NativeClean{
+				Description: "Removes each installed model through Ollama itself, so it can unlink shared base " +
+					"layers correctly and keep its manifests consistent, instead of us deleting weight files out " +
+					"from under it. The Ollama server has to be running — this is the one native command here that " +
+					"talks to a daemon rather than the filesystem, and it stops with Ollama's own error if it " +
+					"can't connect.",
+				Command: `ollama list | awk 'NR>1 {print $1}' | while IFS= read -r m; do [ -n "$m" ] && ollama rm "$m"; done`,
+			},
 		},
 	},
 	{

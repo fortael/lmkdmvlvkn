@@ -141,13 +141,31 @@ const orphanNote = " No installed application claims this bundle identifier, so 
 	"under ~/Library. Worth confirming before you act on it: background updaters, Safari web extensions and " +
 	"command-line tools legitimately own folders here without shipping an .app of their own."
 
+// leftoversPossible reports whether root is somewhere apps abandon
+// bundle-ID-named folders when uninstalled.
+//
+// It is deliberately limited to the Library roots. On the Applications tab
+// the rows *are* the applications, so asking whether an app is installed
+// is incoherent — and actively wrong, since a bundle's folder name is not
+// its identifier: zoom.us.app parses as a plausible identifier but Zoom
+// ships as us.zoom.xos, which would flag an installed app as a leftover.
+// The Home tab lists paths, not identifiers, so it has nothing to check.
+func leftoversPossible(root Root) bool {
+	switch root {
+	case RootCaches, RootAppSupport, RootGroupContainers, RootLogs, RootContainers:
+		return true
+	default:
+		return false
+	}
+}
+
 // AnnotateOrphan adds leftover context to e when name has no installed
 // owner. It never changes Score, Commands or CleanPaths — a folder that
 // the dictionary rated Risky stays Risky, and an Unknown folder stays
 // uncleanable. The only thing that changes is what the user is told, which
 // is exactly the amount of authority a heuristic like this has earned.
-func AnnotateOrphan(e Entry, name string, ix AppIndex) Entry {
-	if !ix.Orphaned(name) {
+func AnnotateOrphan(e Entry, root Root, name string, ix AppIndex) Entry {
+	if !leftoversPossible(root) || !ix.Orphaned(name) {
 		return e
 	}
 	if e.Description == "" {
@@ -156,4 +174,15 @@ func AnnotateOrphan(e Entry, name string, ix AppIndex) Entry {
 	e.Description += orphanNote
 	e.Orphan = true
 	return e
+}
+
+// AppIndexForTest builds a ready index over the given bundle identifiers.
+// Exported so the UI package can exercise orphan-dependent behaviour
+// without shelling out to `defaults read` for every installed app.
+func AppIndexForTest(ids ...string) AppIndex {
+	m := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		m[strings.ToLower(id)] = true
+	}
+	return AppIndex{ids: m, ready: true}
 }

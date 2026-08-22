@@ -25,21 +25,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.detailScroll = 0
 		return m, nil
 
-	case "1":
-		m.activeTab = tabSystemData
-		m.detailScroll = 0
+	case "1", "2", "3", "4", "5", "6", "7":
+		if n := int(msg.String()[0] - '1'); n < int(tabCount) {
+			m.activeTab = tab(n)
+			m.detailScroll = 0
+		}
 		return m, nil
-	case "2":
-		m.activeTab = tabDocker
-		m.detailScroll = 0
-		return m, nil
-	case "3":
-		m.activeTab = tabHome
-		m.detailScroll = 0
-		return m, nil
-	case "4":
-		m.activeTab = tabApplications
-		m.detailScroll = 0
+
+	case " ":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.toggleSelection()
+
+	case "a":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.selectAll()
+
+	case "c":
+		if m.activeTab == tabResults {
+			m.mode = modeConfirmClearHistory
+			return m, nil
+		}
+		return m.startBatch()
+
+	case "x":
+		m.clearSelection()
 		return m, nil
 
 	case "up", "k":
@@ -112,43 +125,40 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "enter":
 		switch m.mode {
-		case modeConfirmClean:
+		case modeConfirmClean, modeConfirmNative, modeConfirmManualDelete:
 			m.mode = modeNormal
 			m.cleaning = true
 			m.spinnerFrame = 0
-			path := m.confirmPath
-			patterns := m.confirmCleanPaths
-			m.confirmPath = ""
-			m.confirmCleanPaths = nil
-			m.statusMsg = "cleaning..."
-			return m, tea.Batch(cleanCmd(path, patterns), spinnerTickCmd())
-		case modeConfirmNative:
+			step := m.confirmStep
+			m.confirmStep = batchStep{}
+			m.statusMsg = step.action.String() + "ing..."
+			return m, tea.Batch(runStepCmd(step), spinnerTickCmd())
+
+		case modeConfirmBatch:
 			m.mode = modeNormal
 			m.cleaning = true
 			m.spinnerFrame = 0
-			path := m.confirmPath
-			command := m.confirmNativeCmd
-			m.confirmPath = ""
-			m.confirmNativeCmd = ""
-			m.confirmNativeLabel = ""
-			m.statusMsg = "running native clean..."
-			return m, tea.Batch(nativeCleanCmd(path, command), spinnerTickCmd())
-		case modeConfirmManualDelete:
+			steps := m.orderedSteps()
+			if len(steps) == 0 {
+				m.cleaning = false
+				return m, nil
+			}
+			m.batch = batchResult{running: true, total: len(steps)}
+			// Buffered so a slow repaint can never stall the worker
+			// between steps; the UI drains it one message at a time.
+			m.batchCh = make(chan batchProgressMsg, 64)
+			m.statusMsg = "running batch..."
+			return m, tea.Batch(spawnBatchCmd(steps, m.batchCh), waitForBatchCmd(m.batchCh), spinnerTickCmd())
+
+		case modeConfirmClearHistory:
 			m.mode = modeNormal
-			m.cleaning = true
-			m.spinnerFrame = 0
-			path := m.confirmPath
-			m.confirmPath = ""
-			m.statusMsg = "deleting..."
-			return m, tea.Batch(manualDeleteCmd(path), spinnerTickCmd())
+			return m, clearHistoryCmd()
 		}
 		return m, nil
+
 	case "n", "esc", "ctrl+c", "q":
 		m.mode = modeNormal
-		m.confirmPath = ""
-		m.confirmCleanPaths = nil
-		m.confirmNativeCmd = ""
-		m.confirmNativeLabel = ""
+		m.confirmStep = batchStep{}
 		return m, nil
 	}
 	return m, nil
@@ -182,6 +192,8 @@ func (m Model) rescan() (Model, tea.Cmd) {
 	f.selected = ""
 	f.loadErr = ""
 	f.loading = true
+	f.pinned = true
+	f.scores = nil
 
 	// The System Data landing frame merges several roots; everything else
 	// — including any folder drilled into from it — is one real directory.
@@ -198,6 +210,16 @@ func (m Model) rescan() (Model, tea.Cmd) {
 	if f.path == "" && m.activeTab == tabApplications {
 		f.pending = 1
 		return m, loadAppsCmd(f.id)
+	}
+
+	if m.activeTab == tabDocker {
+		f.pending = 1
+		return m, loadDockerCmd()
+	}
+
+	if m.activeTab == tabVendors {
+		f.pending = 1
+		return m, loadVendorsCmd()
 	}
 
 	f.pending = 1
@@ -220,8 +242,13 @@ func (m Model) startClean() (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.mode = modeConfirmClean
-	m.confirmPath = entry.Path
-	m.confirmCleanPaths = k.CleanPaths
+	m.confirmStep = batchStep{
+		path:       entry.Path,
+		name:       entry.Name,
+		source:     m.activeTab.String(),
+		action:     batchClean,
+		cleanPaths: k.CleanPaths,
+	}
 	return m, nil
 }
 
@@ -236,13 +263,17 @@ func (m Model) startNativeClean() (Model, tea.Cmd) {
 		return m, nil
 	}
 	k := m.knowledgeFor(entry)
-	if k.Native == nil {
+	if k.Native == nil || k.Protected {
 		return m, nil
 	}
 	m.mode = modeConfirmNative
-	m.confirmPath = entry.Path
-	m.confirmNativeCmd = k.Native.Command
-	m.confirmNativeLabel = entry.Name
+	m.confirmStep = batchStep{
+		path:    entry.Path,
+		name:    entry.Name,
+		source:  m.activeTab.String(),
+		action:  batchNative,
+		command: k.Native.Command,
+	}
 	return m, nil
 }
 
@@ -260,9 +291,116 @@ func (m Model) startManualDelete() (Model, tea.Cmd) {
 	if entry == nil {
 		return m, nil
 	}
+	if !m.knowledgeFor(entry).CanDelete() {
+		return m, nil
+	}
+	// Docker objects have no file to delete; removing one means running
+	// Docker's own command, which is the native action.
+	if entry.Root == string(knowledge.RootDocker) {
+		m.statusMsg = "remove Docker objects with the native command (n)"
+		return m, nil
+	}
 	m.mode = modeConfirmManualDelete
-	m.confirmPath = entry.Path
+	m.confirmStep = batchStep{
+		path:   entry.Path,
+		name:   entry.Name,
+		source: m.activeTab.String(),
+		action: batchDelete,
+	}
 	return m, nil
+}
+
+// toggleSelection adds or removes the current row from the batch set.
+// Rows that offer no action at all — unresearched, protected, plain
+// containers — simply can't be ticked, and say so.
+func (m Model) toggleSelection() (Model, tea.Cmd) {
+	if m.cleaning {
+		return m, nil
+	}
+	e := m.selectedEntry()
+	if e == nil {
+		return m, nil
+	}
+	if _, ok := m.selected[e.Path]; ok {
+		m.deselect(e.Path)
+		return m, nil
+	}
+	step, ok := m.selectableStep(e)
+	if !ok {
+		m.statusMsg = "nothing to clean for " + e.Name
+		return m, nil
+	}
+	step.source = m.activeTab.String()
+	m.selected[e.Path] = step
+	m.selOrder = append(m.selOrder, e.Path)
+
+	// A granular clean's yield has to be measured before the button can
+	// show a total, so kick that off as soon as the row is ticked rather
+	// than waiting for the cursor to happen to rest on it.
+	if !step.estimateReady {
+		if k := m.knowledgeFor(e); len(k.CleanPaths) > 0 {
+			if _, pending := m.reclaimCache[e.Path]; !pending {
+				m.reclaimCache[e.Path] = reclaimInfo{}
+				return m, reclaimSizeCmd(e.Path, k.CleanPaths)
+			}
+		}
+	}
+	return m, nil
+}
+
+// deselect drops one path from the batch set, keeping the order slice in
+// step with the map.
+func (m *Model) deselect(path string) {
+	if _, ok := m.selected[path]; !ok {
+		return
+	}
+	delete(m.selected, path)
+	for i, p := range m.selOrder {
+		if p == path {
+			m.selOrder = append(m.selOrder[:i], m.selOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+// startBatch opens the confirm screen for the queued selection.
+func (m Model) startBatch() (Model, tea.Cmd) {
+	if m.cleaning || len(m.selOrder) == 0 {
+		return m, nil
+	}
+	m.mode = modeConfirmBatch
+	return m, nil
+}
+
+// selectAll ticks every actionable row in the current listing — the
+// "delete all" affordance on the Leftovers tab, where the rows are
+// folders belonging to apps that are no longer installed.
+func (m Model) selectAll() (Model, tea.Cmd) {
+	if m.cleaning {
+		return m, nil
+	}
+	var cmds []tea.Cmd
+	for _, e := range m.currentEntries() {
+		if _, already := m.selected[e.Path]; already {
+			continue
+		}
+		step, ok := m.selectableStep(e)
+		if !ok {
+			continue
+		}
+		step.source = m.activeTab.String()
+		m.selected[e.Path] = step
+		m.selOrder = append(m.selOrder, e.Path)
+		if !step.estimateReady {
+			if k := m.knowledgeFor(e); len(k.CleanPaths) > 0 {
+				if _, pending := m.reclaimCache[e.Path]; !pending {
+					m.reclaimCache[e.Path] = reclaimInfo{}
+					cmds = append(cmds, reclaimSizeCmd(e.Path, k.CleanPaths))
+				}
+			}
+		}
+	}
+	return m, tea.Batch(cmds...)
 }
 
 func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
@@ -305,6 +443,13 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 					return m.startNativeClean()
 				case actionManualDelete:
 					return m.startManualDelete()
+				case actionRunBatch:
+					return m.startBatch()
+				case actionSelectAll:
+					return m.selectAll()
+				case actionClearHistory:
+					m.mode = modeConfirmClearHistory
+					return m, nil
 				}
 				return m, nil
 			}
@@ -329,6 +474,10 @@ func (m Model) clickSort(col sortColumn) Model {
 	}
 	for ti := range m.navs {
 		for fi := range m.navs[ti] {
+			// Re-pin: asking to sort by a column means wanting to see what
+			// is at the top of it, not to follow the old selection to
+			// wherever the new order sent it.
+			m.navs[ti][fi].pinned = true
 			m.sortFrame(&m.navs[ti][fi])
 		}
 	}
@@ -356,6 +505,7 @@ func (m Model) openSelected() (Model, tea.Cmd) {
 		path:    e.Path,
 		root:    root,
 		source:  e.Source,
+		pinned:  true,
 		loading: true,
 		pending: 1,
 	}
@@ -395,5 +545,8 @@ func (m *Model) moveSelection(delta int) {
 	if idx >= 0 {
 		f.selected = f.entries[idx].Path
 	}
+	// A deliberate move takes over from the auto-follow-the-top behaviour
+	// that keeps the cursor on the biggest row while sizes stream in.
+	f.pinned = false
 	m.detailScroll = 0
 }

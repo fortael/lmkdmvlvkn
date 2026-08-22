@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // writeSparse creates a file with a large logical size but only one block
@@ -205,5 +206,70 @@ func TestGlobSizeMeasuresMatchesOnly(t *testing.T) {
 	}
 	if got >= whole {
 		t.Errorf("GlobSize(drop) = %d, want less than the whole tree %d (matched more than the pattern)", got, whole)
+	}
+}
+
+// Enqueue is called from the UI's update loop, so it must never block —
+// no matter how far behind the workers are. A bounded queue here
+// deadlocked the whole app: the UI froze mid-enqueue, stopped draining
+// Results, and every worker then blocked trying to report. The five
+// Library roots produce well over a thousand entries, so this is the
+// normal case, not an edge case.
+func TestEnqueueNeverBlocks(t *testing.T) {
+	s := NewScanner(1)
+	dir := t.TempDir()
+
+	const jobs = 5000
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < jobs; i++ {
+			s.Enqueue(dir)
+		}
+		close(done)
+	}()
+
+	// Drain concurrently, but far more slowly than we enqueue, so the
+	// queue is guaranteed to run well past any plausible buffer size.
+	go func() {
+		for range s.Results {
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Enqueue blocked after fewer than %d jobs; the pending queue must be unbounded", jobs)
+	}
+}
+
+// Everything queued has to come back out, in the face of many workers
+// popping from the shared queue at once.
+func TestScannerMeasuresEveryQueuedPath(t *testing.T) {
+	s := NewScanner(4)
+	want := make(map[string]bool)
+	for i := 0; i < 50; i++ {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "f.bin"), make([]byte, 8<<10), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		want[dir] = true
+		s.Enqueue(dir)
+	}
+
+	got := make(map[string]bool, len(want))
+	deadline := time.After(30 * time.Second)
+	for len(got) < len(want) {
+		select {
+		case r := <-s.Results:
+			if r.Err != nil {
+				t.Errorf("measuring %s: %v", r.Path, r.Err)
+			}
+			if r.Size <= 0 {
+				t.Errorf("%s measured as %d bytes, want positive", r.Path, r.Size)
+			}
+			got[r.Path] = true
+		case <-deadline:
+			t.Fatalf("only %d of %d results arrived", len(got), len(want))
+		}
 	}
 }
