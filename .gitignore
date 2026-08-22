@@ -1,0 +1,5 @@
+.idea
+maccleaner
+.DS_Store
+coverage.out
+tmp
