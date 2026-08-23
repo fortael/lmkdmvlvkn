@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -116,39 +117,134 @@ type systemDF struct {
 // the classification depends on: which image ID a container actually
 // resolved to, and when it last ran as a timestamp rather than the prose
 // "Exited (0) 3 weeks ago".
+//
+// The mount list is what joins a volume back to the container that created
+// it, and Destination is the field that makes an anonymous volume
+// intelligible: "/var/lib/mysql" says more about a 64-hex volume than its
+// name, its size and its creation date put together.
+// The nested structs are named rather than inline so that adding a field
+// to one of them does not break every test that builds a fixture.
 type containerInspect struct {
 	ID      string `json:"Id"`
 	Name    string
 	Created string
 	Image   string
-	State   struct {
-		Status     string
-		Running    bool
-		StartedAt  string
-		FinishedAt string
-	}
-	Config struct {
-		Image  string
-		Labels map[string]string
-	}
-	Mounts []struct {
-		Type        string
-		Name        string
-		Source      string
-		Destination string
-	}
+	// Path and Args are the process the container actually runs, which is
+	// not necessarily the image's CMD.
+	Path   string
+	Args   []string
+	State  containerState
+	Config containerConfig
+	Mounts []containerMount
+}
+
+// containerState is inspect's State object.
+type containerState struct {
+	Status     string
+	Running    bool
+	StartedAt  string
+	FinishedAt string
+	ExitCode   int
+}
+
+// containerConfig is the slice of inspect's Config object worth reading.
+type containerConfig struct {
+	Image      string
+	Labels     map[string]string
+	Env        []string
+	Cmd        []string
+	Entrypoint []string
+	WorkingDir string
+}
+
+// containerMount is one entry of inspect's Mounts array. RW is Docker's
+// spelling of "not read-only".
+type containerMount struct {
+	Type        string
+	Name        string
+	Source      string
+	Destination string
+	RW          bool
 }
 
 // volumeInspect is the slice of `docker volume inspect` this package
-// reads. It is fetched only for CreatedAt, which the listing formats
-// cannot produce at all, and for Labels as a real map rather than the
-// flattened string `docker volume ls` prints.
+// reads. It is fetched for CreatedAt, which the listing formats cannot
+// produce at all, for Labels as a real map rather than the flattened string
+// `docker volume ls` prints, and for the mountpoint, which is where the
+// contents might be readable from.
 type volumeInspect struct {
 	Name       string
 	Driver     string
 	Mountpoint string
 	CreatedAt  string
 	Labels     map[string]string
+	Options    map[string]string
+}
+
+// imageInspect is the slice of `docker image inspect` this package reads.
+//
+// Unlike the listing commands this is the daemon's real JSON rather than a
+// text template, so its numbers are numbers. Everything here answers a
+// question `docker images` cannot: what the image declares (VOLUME, EXPOSE,
+// ENTRYPOINT), what labels it carries — org.opencontainers.image.source
+// names the repository it was built from — which layers it is made of, and
+// when it arrived on this machine as opposed to when its publisher built
+// it.
+type imageInspect struct {
+	ID           string `json:"Id"`
+	RepoTags     []string
+	RepoDigests  []string
+	Created      string
+	Comment      string
+	Architecture string
+	Os           string
+	Config       imageConfig
+	RootFS       imageRootFS
+	Metadata     imageMetadata
+}
+
+// imageConfig is the slice of an image's config worth reading.
+//
+// ExposedPorts and Volumes are JSON objects whose values are empty — the
+// wire encoding of a set — so the keys are the whole content.
+type imageConfig struct {
+	Env          []string
+	Cmd          []string
+	Entrypoint   []string
+	WorkingDir   string
+	User         string
+	Labels       map[string]string
+	ExposedPorts map[string]struct{}
+	Volumes      map[string]struct{}
+}
+
+// imageRootFS is the image's layer list, which is what establishes that one
+// image was built on another.
+type imageRootFS struct {
+	Type   string
+	Layers []string
+}
+
+// imageMetadata is the daemon's local bookkeeping about the image.
+type imageMetadata struct {
+	// LastTagTime is when this image last got a name on this machine,
+	// which for a pulled image is when it was pulled. It is local history
+	// rather than the publisher's, and the two are often months apart.
+	LastTagTime string
+}
+
+// sortedKeys returns a map's keys in a stable order, for the sets Docker
+// encodes as JSON objects with empty values (ExposedPorts, Volumes).
+func sortedKeys[V any](m map[string]V) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // decodeLines decodes Docker's line-delimited JSON, one record per line.

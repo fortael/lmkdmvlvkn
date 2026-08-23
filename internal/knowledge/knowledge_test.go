@@ -468,8 +468,12 @@ func TestNoDuplicateDictionaryKeys(t *testing.T) {
 		root   string
 		tables map[string]map[string]Entry
 	}{
-		{"Caches", map[string]map[string]Entry{"cachesDB": cachesDB, "ideCachesDB": ideCachesDB}},
-		{"Application Support", map[string]map[string]Entry{"appSupportDB": appSupportDB, "ideAppSupportDB": ideAppSupportDB}},
+		{"Caches", map[string]map[string]Entry{
+			"cachesDB": cachesDB, "ideCachesDB": ideCachesDB, "appleCachesDB": appleCachesDB}},
+		{"Application Support", map[string]map[string]Entry{
+			"appSupportDB": appSupportDB, "ideAppSupportDB": ideAppSupportDB, "appleAppSupportDB": appleAppSupportDB}},
+		{"Containers", map[string]map[string]Entry{
+			"containersDB": containersDB, "appleContainersDB": appleContainersDB}},
 	}
 	for _, p := range pairs {
 		seen := make(map[string]string)

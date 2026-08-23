@@ -53,7 +53,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case "x":
 		m.clearSelection()
+		if m.onlySelected {
+			m.onlySelected = false
+			m.reconcileSelection()
+		}
 		return m, nil
+
+	case "g", "home":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.applyNavAction(navTop)
+
+	case "G", "end":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.applyNavAction(navBottom)
+
+	case "s":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.applyNavAction(navResetSort)
+
+	case "f":
+		if !m.activeTab.browsable() {
+			return m, nil
+		}
+		return m.applyNavAction(navToggleSelected)
 
 	case "up", "k":
 		if m.activeTab.browsable() {
@@ -193,7 +221,7 @@ func (m Model) rescan() (Model, tea.Cmd) {
 	f.loadErr = ""
 	f.loading = true
 	f.pinned = true
-	f.scores = nil
+	f.scores, f.orphan = nil, nil
 
 	// The System Data landing frame merges several roots; everything else
 	// — including any folder drilled into from it — is one real directory.
@@ -217,9 +245,14 @@ func (m Model) rescan() (Model, tea.Cmd) {
 		return m, loadDockerCmd()
 	}
 
-	if m.activeTab == tabVendors {
+	if m.activeTab == tabVendors && f.path == "" {
 		f.pending = 1
 		return m, loadVendorsCmd()
+	}
+
+	if ollamaRootParent() != "" && f.path == ollamaRootParent() {
+		f.pending = 1
+		return m, loadOllamaCmd(f.id)
 	}
 
 	f.pending = 1
@@ -404,6 +437,29 @@ func (m Model) selectAll() (Model, tea.Cmd) {
 }
 
 func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
+	// The wheel is the main reason this exists: compact Mac keyboards have
+	// no PgUp/PgDn, so without it the description panel could only be
+	// scrolled by a key the user does not have. Over the table it moves the
+	// cursor; over anything else it scrolls the description.
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		if !m.activeTab.browsable() && m.activeTab != tabResults {
+			return m, nil
+		}
+		up := msg.Button == tea.MouseButtonWheelUp
+		overTable := m.activeTab.browsable() && msg.Y > tableHeaderY && msg.Y < m.detailToolbarY()-1
+		switch {
+		case overTable && up:
+			m.moveSelection(-1)
+		case overTable:
+			m.moveSelection(1)
+		case up:
+			return m.applyNavAction(navScrollUp)
+		default:
+			return m.applyNavAction(navScrollDown)
+		}
+		return m, nil
+	}
+
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return m, nil
 	}
@@ -420,6 +476,33 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	}
 
 	if !m.activeTab.browsable() || m.mode != modeNormal || m.cleaning {
+		return m, nil
+	}
+
+	// Navigation controls sit on the strip between the tab bar and table.
+	if msg.Y == tabBarHeight {
+		for _, r := range m.navRegions() {
+			if msg.X >= r.x0 && msg.X <= r.x1 {
+				return m.applyNavAction(r.action)
+			}
+		}
+		return m, nil
+	}
+
+	if msg.Y == m.detailToolbarY() {
+		for _, r := range m.detailScrollRegions() {
+			if msg.X >= r.x0 && msg.X <= r.x1 {
+				return m.applyNavAction(r.action)
+			}
+		}
+		return m, nil
+	}
+
+	// Clicking a table row selects it.
+	if msg.Y > tableHeaderY && msg.Y < m.detailToolbarY()-1 {
+		if idx := m.rowIndexAt(msg.Y); idx >= 0 {
+			m.jumpSelection(idx)
+		}
 		return m, nil
 	}
 
@@ -466,12 +549,19 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 // frame, on every tab, is re-sorted immediately so navigating back into
 // one respects the new order without waiting on a fresh scan message.
 func (m Model) clickSort(col sortColumn) Model {
+	asc := col == sortByName
 	if m.sortCol == col {
-		m.sortAsc = !m.sortAsc
-	} else {
-		m.sortCol = col
-		m.sortAsc = col == sortByName
+		asc = !m.sortAsc
 	}
+	return m.clickSortTo(col, asc)
+}
+
+// clickSortTo applies an explicit column and direction, without the
+// toggling clickSort does — used by the "reset sort" control, which has a
+// specific order in mind rather than "the other way round from now".
+func (m Model) clickSortTo(col sortColumn, asc bool) Model {
+	m.sortCol = col
+	m.sortAsc = asc
 	for ti := range m.navs {
 		for fi := range m.navs[ti] {
 			// Re-pin: asking to sort by a column means wanting to see what
@@ -498,6 +588,26 @@ func (m Model) openSelected() (Model, tea.Cmd) {
 	if e == nil || !e.IsDir {
 		return m, nil
 	}
+	// Opening ~/.ollama lists installed models instead of the directory
+	// tree underneath it, which is otherwise a dead end: models/blobs is
+	// nothing but sha256-<64 hex> files with no indication of which model
+	// any of them belongs to.
+	if ollamaRootParent() != "" && e.Path == ollamaRootParent() {
+		f := navFrame{
+			id:      m.newFrameID(),
+			label:   e.Name,
+			path:    e.Path,
+			root:    knowledge.RootHome,
+			source:  "model",
+			pinned:  true,
+			loading: true,
+			pending: 1,
+		}
+		m.navs[m.activeTab] = append(m.navs[m.activeTab], f)
+		m.detailScroll = 0
+		return m, loadOllamaCmd(f.id)
+	}
+
 	root := knowledge.Root(e.Root)
 	f := navFrame{
 		id:      m.newFrameID(),

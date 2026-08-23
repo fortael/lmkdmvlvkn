@@ -246,11 +246,11 @@ func HomeItems() []HomeItem {
 // db is the per-root dictionary. Each root's table lives in its own file
 // (caches.go, appsupport.go, ...) so the curated prose stays browsable.
 var db = map[Root]map[string]Entry{
-	RootCaches:          mergeTables(cachesDB, ideCachesDB),
-	RootAppSupport:      mergeTables(appSupportDB, ideAppSupportDB),
+	RootCaches:          mergeTables(cachesDB, ideCachesDB, appleCachesDB),
+	RootAppSupport:      mergeTables(appSupportDB, ideAppSupportDB, appleAppSupportDB),
 	RootGroupContainers: groupContainersDB,
 	RootLogs:            logsDB,
-	RootContainers:      containersDB,
+	RootContainers:      mergeTables(containersDB, appleContainersDB),
 	RootApplications:    applicationsDB,
 }
 

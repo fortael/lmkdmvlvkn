@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -89,8 +88,8 @@ var (
 )
 
 const (
-	colMarker = 4 // cursor arrow + batch-selection checkbox
-	colType   = 7
+	colMarker = 4  // cursor arrow + batch-selection checkbox
+	colType   = 11 // fits the longest TYPE label, Docker's "Build cache"
 	colSize   = 9
 	colBar    = 18
 	colMod    = 5
@@ -101,7 +100,7 @@ const (
 
 const (
 	tabBarHeight      = 3 // tab boxes: 1 line of padding + 1 line text + 1 line padding
-	breadcrumbHeight  = 1
+	navBarHeight      = 1 // breadcrumb on the left, clickable controls on the right
 	cleanButtonHeight = 3 // border(2) + one text line, no vertical padding — kept small on purpose
 	detailScrollStep  = 3
 
@@ -109,7 +108,7 @@ const (
 	// render on: past the tab bar, the breadcrumb line, and the table
 	// box's top border. Unlike the button row this never depends on
 	// terminal height, so it can be a plain constant.
-	tableHeaderY = tabBarHeight + breadcrumbHeight + 1
+	tableHeaderY = tabBarHeight + navBarHeight + 1
 
 	// wideBreakpoint is roughly 1000px of terminal width, assuming ~8px
 	// per monospace cell — above this the detail panel splits into two
@@ -123,7 +122,7 @@ const (
 // rendering and mouse hit-testing (which needs to know where the button
 // row starts) can never disagree. Every browsable tab shares the layout.
 func (m Model) contentLayout() (tableH, detailH int) {
-	contentH := m.height - tabBarHeight - breadcrumbHeight - cleanButtonHeight - 1
+	contentH := m.height - tabBarHeight - navBarHeight - cleanButtonHeight - 1
 	if contentH < 6 {
 		contentH = 6
 	}
@@ -141,7 +140,7 @@ func (m Model) contentLayout() (tableH, detailH int) {
 // buttonRowY is the screen row the clean/native-clean buttons start on.
 func (m Model) buttonRowY() int {
 	tableH, detailH := m.contentLayout()
-	return tabBarHeight + breadcrumbHeight + tableH + detailH
+	return tabBarHeight + navBarHeight + tableH + detailH
 }
 
 // tableNameWidth is the NAME column's width for the current terminal size
@@ -193,7 +192,7 @@ func (m Model) render() string {
 	// button or help line off screen.
 	tableH, detailH := m.contentLayout()
 
-	b.WriteString(m.renderBreadcrumb(m.width))
+	b.WriteString(m.renderNavBar(m.width))
 	b.WriteString("\n")
 	b.WriteString(m.renderTable(m.width, tableH))
 	b.WriteString("\n")
@@ -282,14 +281,6 @@ func (m Model) renderTabs() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, boxes...)
 }
 
-func (m Model) renderBreadcrumb(width int) string {
-	text := m.breadcrumb()
-	if len(m.navs[m.activeTab]) > 1 {
-		text += "   (Esc/Backspace to go up)"
-	}
-	return dimStyle.Render(truncate(text, width))
-}
-
 // emptyMessage explains an empty listing in the terms of whichever tab is
 // showing it, since "empty directory" is meaningless on the tabs whose
 // rows aren't directories at all.
@@ -340,20 +331,7 @@ func (m Model) renderTable(width, height int) string {
 			visibleRows = 1
 		}
 		idx := m.selectedIndex()
-		offset := 0
-		if idx >= 0 {
-			offset = idx - visibleRows/2
-		}
-		maxOffset := len(entries) - visibleRows
-		if maxOffset < 0 {
-			maxOffset = 0
-		}
-		if offset > maxOffset {
-			offset = maxOffset
-		}
-		if offset < 0 {
-			offset = 0
-		}
+		offset := tableOffset(idx, len(entries), visibleRows)
 
 		max := maxSize(entries)
 		end := offset + visibleRows
@@ -370,6 +348,52 @@ func (m Model) renderTable(width, height int) string {
 
 	content := header + "\n" + body
 	return boxStyle.Width(innerW).Height(innerH).Render(content)
+}
+
+// tableOffset is the index of the first visible row: the selection kept
+// centred, clamped to the ends of the list. Shared by rendering and by
+// row hit-testing so a click always lands on the row under the pointer.
+func tableOffset(selected, total, visibleRows int) int {
+	offset := 0
+	if selected >= 0 {
+		offset = selected - visibleRows/2
+	}
+	maxOffset := total - visibleRows
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
+// tableVisibleRows is how many data rows the table shows: its box height
+// less the two border lines and the column header.
+func (m Model) tableVisibleRows() int {
+	tableH, _ := m.contentLayout()
+	n := tableH - 3
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// rowIndexAt maps a screen row to an index in the current listing, or -1
+// when the click was past the last row.
+func (m Model) rowIndexAt(y int) int {
+	entries := m.currentEntries()
+	visible := m.tableVisibleRows()
+	offset := tableOffset(m.selectedIndex(), len(entries), visible)
+	// tableHeaderY is the column-header row; data starts on the next line.
+	idx := offset + (y - tableHeaderY - 1)
+	if idx < 0 || idx >= len(entries) {
+		return -1
+	}
+	return idx
 }
 
 // sortArrow returns a 1-column indicator appended to a header label when
@@ -435,7 +459,6 @@ func (m Model) headerRegions() []headerRegion {
 	modX0 := x
 	x += colMod + 1
 	safeX0 := x
-	x += colScore + 1
 
 	return []headerRegion{
 		{col: sortByName, x0: nameX0, x1: nameX0 + nameW - 1},
@@ -599,6 +622,9 @@ func (m Model) renderDetail(width, height int) string {
 
 	k := m.knowledgeFor(e)
 
+	if m.activeTab == tabDocker {
+		return m.renderDockerDetail(e, k, width, innerW, innerH)
+	}
 	if width >= wideBreakpoint {
 		return m.renderDetailWide(e, k, width, innerW, innerH)
 	}
@@ -610,8 +636,14 @@ func (m Model) renderDetailNarrow(e *scan.Entry, k knowledge.Entry, width, inner
 	lines = append(lines, "")
 	lines = append(lines, buildDescLines(k, innerW)...)
 
-	window := scrollWindow(lines, m.detailScroll, innerH)
-	content := strings.Join(window, "\n")
+	// One line goes to the scroll controls; the rest scrolls.
+	bodyH := innerH - 1
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	window := scrollWindow(lines, m.detailScroll, bodyH)
+	toolbar := m.renderDetailToolbar(innerW, m.detailScroll > 0, len(lines) > bodyH+m.detailScroll)
+	content := toolbar + "\n" + strings.Join(window, "\n")
 	return boxStyle.Width(width - 2).Height(innerH).Render(content)
 }
 
@@ -626,14 +658,25 @@ func (m Model) renderDetailWide(e *scan.Entry, k knowledge.Entry, width, innerW,
 		rightW = 10
 	}
 
-	leftWin := scrollWindow(m.buildMetaLines(e, k, leftW), m.detailScroll, innerH)
-	rightWin := scrollWindow(buildDescLines(k, rightW), m.detailScroll, innerH)
+	leftLines := m.buildMetaLines(e, k, leftW)
+	rightLines := buildDescLines(k, rightW)
+
+	bodyH := innerH - 1
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	leftWin := scrollWindow(leftLines, m.detailScroll, bodyH)
+	rightWin := scrollWindow(rightLines, m.detailScroll, bodyH)
+
+	longest := len(leftLines)
+	if len(rightLines) > longest {
+		longest = len(rightLines)
+	}
 
 	var b strings.Builder
-	for i := 0; i < innerH; i++ {
-		if i > 0 {
-			b.WriteString("\n")
-		}
+	b.WriteString(m.renderDetailToolbar(innerW, m.detailScroll > 0, longest > bodyH+m.detailScroll))
+	for i := 0; i < bodyH; i++ {
+		b.WriteString("\n")
 		b.WriteString(ansiPadRight(leftWin[i], leftW))
 		b.WriteString(faintStyle.Render(sep))
 		b.WriteString(rightWin[i])
@@ -1024,11 +1067,9 @@ func (m Model) renderConfirm(width, height int) string {
 		borderColor = cRed
 		lines = append(lines, redStyle.Render(fmt.Sprintf("Permanently delete the ENTIRE folder %q?", m.confirmStep.name)))
 		lines = append(lines, "")
-		for _, l := range wrapText(
+		lines = append(lines, wrapText(
 			"This is the manual override — it bypasses the knowledge base entirely and removes the folder itself, "+
-				"not just its contents. Not gated by any safety rating. This cannot be undone.", innerW) {
-			lines = append(lines, l)
-		}
+				"not just its contents. Not gated by any safety rating. This cannot be undone.", innerW)...)
 		lines = append(lines, "")
 		lines = append(lines, accentStyle.Render("$ ")+dimStyle.Render(truncate("rm -rf "+m.confirmStep.path, innerW-2)))
 		lines = append(lines, "")
@@ -1038,11 +1079,9 @@ func (m Model) renderConfirm(width, height int) string {
 		borderColor = cRed
 		lines = append(lines, redStyle.Render("Clear the cleanup history?"))
 		lines = append(lines, "")
-		for _, l := range wrapText(
+		lines = append(lines, wrapText(
 			"This deletes the log of what this app has removed. It frees no disk space of its own and does not "+
-				"restore anything — you simply lose the record, including the all-time total.", innerW) {
-			lines = append(lines, l)
-		}
+				"restore anything — you simply lose the record, including the all-time total.", innerW)...)
 		lines = append(lines, "")
 		lines = append(lines, redStyle.Render("[y] Yes, clear it")+"    "+dimStyle.Render("[n/esc] Cancel"))
 
@@ -1066,7 +1105,7 @@ func (m Model) renderConfirm(width, height int) string {
 				lines = append(lines, "This only removes the specific cache paths below — the rest of the folder is left alone:")
 			}
 			for _, pat := range m.confirmStep.cleanPaths {
-				cmd := "rm -rf " + filepath.Join(m.confirmStep.path, pat)
+				cmd := "rm -rf " + resolveCleanPath(m.confirmStep.path, pat)
 				sizeSuffix := ""
 				if ready {
 					if sz, ok := info.perPath[pat]; ok {
@@ -1159,8 +1198,8 @@ func (m Model) renderHelp() string {
 	case modeConfirmClearHistory:
 		return redStyle.Render("confirm clearing the history above")
 	}
-	left := "↑/↓ move   space select   c run batch   a select all   x clear   Enter open   d clean   n native   " +
-		"D delete   Esc/⌫ back   PgUp/PgDn scroll   tab switch   r rescan   q quit"
+	left := "↑/↓ move   space select   c run batch   a all   x clear   f only-selected   g/G top/end   s reset sort   " +
+		"Enter open   d clean   n native   D delete   Esc back   wheel scroll   tab switch   r rescan   q quit"
 	switch {
 	case m.activeTab == tabResults:
 		left = "PgUp/PgDn scroll   c clear history   tab switch tabs   q quit"

@@ -114,6 +114,7 @@ type batchResult struct {
 // back to plain stdout, which we do capture.
 func runNative(dir, command string) (string, error) {
 	cmd := exec.Command("sh", "-c", command)
+	cmd.Env = append(os.Environ(), "PATH="+nativePath())
 	// A working directory only makes sense if it is one; entries whose
 	// target is a file (or has already vanished) run from the parent.
 	if info, err := os.Lstat(dir); err == nil && !info.IsDir() {
@@ -124,6 +125,50 @@ func runNative(dir, command string) (string, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	out, err := cmd.CombinedOutput()
 	return lastLine(string(out)), err
+}
+
+// toolDirs are where the tools our native commands invoke actually live.
+//
+// Every single one of them — ollama, brew, pnpm, npm, go — is in
+// /opt/homebrew/bin on this machine, and docker is in /usr/local/bin.
+// A process launched from Finder or an IDE inherits launchd's minimal
+// PATH (/usr/bin:/bin:/usr/sbin:/sbin), which contains none of them, so
+// every native clean would fail with "command not found" depending only
+// on how the app happened to be started. Prepending these makes the
+// behaviour the same either way.
+var toolDirs = []string{
+	"/opt/homebrew/bin",
+	"/opt/homebrew/sbin",
+	"/usr/local/bin",
+}
+
+// nativePath returns the PATH to run native commands with: the inherited
+// one, plus the usual tool locations and the user's own ~/.local/bin,
+// with duplicates removed so it stays readable in error messages.
+func nativePath() string {
+	var dirs []string
+	seen := make(map[string]bool)
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+
+	for _, d := range strings.Split(os.Getenv("PATH"), ":") {
+		add(d)
+	}
+	for _, d := range toolDirs {
+		add(d)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		add(home + "/.local/bin")
+	}
+	for _, d := range []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+		add(d)
+	}
+	return strings.Join(dirs, ":")
 }
 
 // filepathDir avoids importing path/filepath twice under different names

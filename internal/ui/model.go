@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"lmkdmvlvkn/internal/docker"
 	"lmkdmvlvkn/internal/history"
 	"lmkdmvlvkn/internal/knowledge"
 	"lmkdmvlvkn/internal/scan"
@@ -141,6 +142,12 @@ type navFrame struct {
 	// odd size results — which otherwise meant well over a million regexp
 	// lookups for a single scan.
 	scores map[*scan.Entry]knowledge.Score
+	// orphan caches which rows belong to uninstalled apps, for the same
+	// reason scores is cached: the display filter asks this of every row
+	// on every repaint, and answering it means a dictionary lookup plus a
+	// prefix scan of every installed bundle ID. Recomputing that ~1200
+	// times per frame starved the background size scan.
+	orphan map[*scan.Entry]bool
 }
 
 // removeEntry drops the entry at path from the frame, if present, and
@@ -159,7 +166,7 @@ func (f *navFrame) removeEntry(path string) {
 		return
 	}
 	f.entries = append(f.entries[:idx], f.entries[idx+1:]...)
-	f.scores = nil // the entry set changed; sibling context may have too
+	f.scores, f.orphan = nil, nil // the entry set changed; sibling context may have too
 	if f.selected != path {
 		return
 	}
@@ -204,9 +211,21 @@ type Model struct {
 	// can't go through the name-keyed dictionary the Library tabs use.
 	pathDB map[string]knowledge.Entry
 
+	// dockerItems keeps the full Docker object behind each row so the
+	// detail panel can show its provenance and layers. The Docker tab
+	// deliberately renders differently from the folder tabs: a hash and a
+	// size tell a developer nothing, and `docker inspect` already exists —
+	// this has to be more useful than that or it has no reason to be here.
+	dockerItems map[string]docker.Item
+
 	// dockerReason explains why the Docker tab is empty when the daemon
 	// isn't reachable.
 	dockerReason string
+
+	// onlySelected filters every listing down to the batch set, so a long
+	// selection can be reviewed as a list instead of being scattered
+	// through a thousand rows.
+	onlySelected bool
 
 	// appIndex backs orphan detection. It shells out to `defaults read`
 	// once per installed app, so it's built in the background and is
@@ -259,6 +278,7 @@ func New() Model {
 		reclaimCache: make(map[string]reclaimInfo),
 		pathDB:       make(map[string]knowledge.Entry),
 		selected:     make(map[string]batchStep),
+		dockerItems:  make(map[string]docker.Item),
 	}
 
 	m.navs[tabLeftovers] = []navFrame{{
@@ -477,13 +497,28 @@ func runStepCmd(s batchStep) tea.Cmd {
 	}
 }
 
+// resolveCleanPath turns one CleanPaths pattern into a real path.
+//
+// Patterns are normally relative to the entry's own folder, which is what
+// makes them readable in the dictionary. An absolute pattern is passed
+// through untouched: some entries name specific files scattered across a
+// tree rather than a subtree — removing one Ollama model means deleting
+// its manifest under manifests/ and its blobs under blobs/, which no
+// single relative glob can express.
+func resolveCleanPath(base, pattern string) string {
+	if filepath.IsAbs(pattern) {
+		return pattern
+	}
+	return filepath.Join(base, pattern)
+}
+
 func cleanDir(dir string, relPatterns []string) error {
 	if len(relPatterns) == 0 {
 		return cleanAllChildren(dir)
 	}
 	var firstErr error
 	for _, pat := range relPatterns {
-		matches, err := filepath.Glob(filepath.Join(dir, pat))
+		matches, err := filepath.Glob(resolveCleanPath(dir, pat))
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -566,7 +601,7 @@ func reclaimSizeCmd(basePath string, patterns []string) tea.Cmd {
 			if strings.HasPrefix(pat, "#") {
 				continue
 			}
-			size, _ := scan.GlobSize(filepath.Join(basePath, pat))
+			size, _ := scan.GlobSize(resolveCleanPath(basePath, pat))
 			perPath[pat] = size
 			total += size
 		}
@@ -638,7 +673,7 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		f := &m.navs[tabDocker][0]
 		f.loading = false
 		f.pending = 0
-		f.scores = nil
+		f.scores, f.orphan = nil, nil
 		m.dockerReason = msg.reason
 		switch {
 		case !msg.available:
@@ -656,11 +691,31 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case ollamaLoadedMsg:
+		f := m.frameByID(msg.frameID)
+		if f == nil {
+			return m, nil
+		}
+		f.loading = false
+		f.pending = 0
+		f.scores, f.orphan = nil, nil
+		if msg.err != nil {
+			f.loadErr = msg.err.Error()
+			return m, nil
+		}
+		f.loadErr = ""
+		f.entries = m.ollamaEntries(msg.models, msg.orphans, msg.orphanB)
+		m.sortFrame(f)
+		if len(f.entries) > 0 && f.selected == "" {
+			f.selected = f.entries[0].Path
+		}
+		return m, nil
+
 	case vendorsLoadedMsg:
 		f := &m.navs[tabVendors][0]
 		f.loading = false
 		f.pending = 0
-		f.scores = nil
+		f.scores, f.orphan = nil, nil
 		if msg.err != nil {
 			f.loadErr = msg.err.Error()
 			return m, nil
@@ -737,7 +792,7 @@ func (m Model) dispatch(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		f.loadErr = ""
 		f.entries = append(f.entries, msg.entries...)
-		f.scores = nil // new rows change the sibling context of existing ones
+		f.scores, f.orphan = nil, nil // new rows change the sibling context of existing ones
 		m.sortFrame(f)
 		if f.selected == "" && len(f.entries) > 0 {
 			f.selected = f.entries[0].Path
@@ -898,6 +953,8 @@ func (m *Model) rebuildLeftovers() {
 	all := src[0].entries
 	var entries []*scan.Entry
 	for _, e := range all {
+		// Deliberately reads the unfiltered listing: System Data hides
+		// leftovers precisely because they belong here instead.
 		if m.knowledgeIn(all, e).Orphan {
 			entries = append(entries, e)
 		}
@@ -906,7 +963,7 @@ func (m *Model) rebuildLeftovers() {
 	f := &m.navs[tabLeftovers][0]
 	prev := f.selected
 	f.entries = entries
-	f.scores = nil
+	f.scores, f.orphan = nil, nil
 	f.loading = src[0].loading
 	// Keep the cursor where it was if that row is still a leftover.
 	f.selected = ""
@@ -967,15 +1024,26 @@ func (m Model) View() string {
 // thousand times during a full scan — while the ratings themselves depend
 // only on the entry set.
 func (m Model) sortFrame(f *navFrame) {
-	if f.scores == nil {
-		f.scores = make(map[*scan.Entry]knowledge.Score, len(f.entries))
-		for _, e := range f.entries {
-			f.scores[e] = m.knowledgeIn(f.entries, e).Score
-		}
-	}
+	m.ensureFrameCache(f)
 	sortEntries(f.entries, m.sortCol, m.sortAsc, f.scores)
 	if f.pinned && len(f.entries) > 0 {
 		f.selected = f.entries[0].Path
+	}
+}
+
+// ensureFrameCache computes the per-entry score and orphan flags once per
+// entry set. Both depend only on the listing and the installed-app index,
+// never on the sizes that stream in afterwards.
+func (m Model) ensureFrameCache(f *navFrame) {
+	if f.scores != nil && f.orphan != nil {
+		return
+	}
+	f.scores = make(map[*scan.Entry]knowledge.Score, len(f.entries))
+	f.orphan = make(map[*scan.Entry]bool, len(f.entries))
+	for _, e := range f.entries {
+		k := m.knowledgeIn(f.entries, e)
+		f.scores[e] = k.Score
+		f.orphan[e] = k.Orphan
 	}
 }
 
@@ -1052,12 +1120,71 @@ func (m Model) currentFrame() *navFrame {
 	return &nav[len(nav)-1]
 }
 
+// hiddenAppleMax is the size below which an Apple system folder is not
+// worth a row.
+//
+// ~/Library/Containers alone holds 738 folders, nearly all of them Apple
+// extension hosts and daemons occupying 48-64 KB each. Together they are
+// a rounding error on a 228 GB disk, but they bury the handful of rows
+// that actually matter. Nothing is deleted by hiding them — they simply
+// stop competing for the user's attention.
+const hiddenAppleMax = 100 << 10
+
+// currentEntries is the rows the active listing actually shows, after
+// filtering. Everything downstream — selection, the cursor, the table —
+// uses this, so the filtered view is consistent and the cursor can never
+// land on a hidden row.
 func (m Model) currentEntries() []*scan.Entry {
 	f := m.currentFrame()
 	if f == nil {
 		return nil
 	}
-	return f.entries
+	return m.visibleEntries(f)
+}
+
+// visibleEntries applies the display filters to one frame.
+func (m Model) visibleEntries(f *navFrame) []*scan.Entry {
+	// Filters only apply to a tab's landing listing. Once the user has
+	// deliberately drilled into a folder they asked to see its contents,
+	// and hiding part of what is in there would be lying about it.
+	atRoot := len(m.navs[m.activeTab]) == 1
+
+	if !m.onlySelected && !atRoot {
+		return f.entries
+	}
+
+	m.ensureFrameCache(f)
+	out := make([]*scan.Entry, 0, len(f.entries))
+	for _, e := range f.entries {
+		if m.onlySelected {
+			if _, ok := m.selected[e.Path]; !ok {
+				continue
+			}
+		}
+		if atRoot && m.hiddenAtRoot(f, e) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// hiddenAtRoot reports whether e is filtered out of a landing listing.
+func (m Model) hiddenAtRoot(f *navFrame, e *scan.Entry) bool {
+	if m.activeTab != tabSystemData {
+		return false
+	}
+	// Leftovers have their own tab; showing them twice makes the System
+	// Data list longer without telling the user anything new.
+	if f.orphan[e] {
+		return true
+	}
+	// Apple's sub-100 KB system folders — see hiddenAppleMax. Only hidden
+	// once measured, so nothing disappears on the strength of a guess.
+	if strings.HasPrefix(e.Name, "com.apple.") && e.SizeReady && e.Size < hiddenAppleMax {
+		return true
+	}
+	return false
 }
 
 func (m Model) breadcrumb() string {

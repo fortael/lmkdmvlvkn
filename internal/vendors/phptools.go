@@ -225,7 +225,8 @@ func xmlRootAttr(path, attr string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	defer f.Close()
+	// Read-only, so a failed close costs nothing the caller can act on.
+	defer func() { _ = f.Close() }()
 
 	dec := xml.NewDecoder(io.LimitReader(f, 256<<10))
 	for {
@@ -258,7 +259,8 @@ func neonScalar(path, key string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	defer f.Close()
+	// Read-only, so a failed close costs nothing the caller can act on.
+	defer func() { _ = f.Close() }()
 
 	sc := bufio.NewScanner(io.LimitReader(f, 256<<10))
 	for sc.Scan() {

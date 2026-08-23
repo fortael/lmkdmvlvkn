@@ -638,3 +638,214 @@ func TestRunStepRefusesVirtualFilesystemRemoval(t *testing.T) {
 		t.Error("the refused step deleted the directory anyway")
 	}
 }
+
+// --- vendors selection, filters and navigation ---------------------------
+
+func vendorEntry(name, path string, size int64) *scan.Entry {
+	return &scan.Entry{
+		Name: name, Path: path, Source: "node", Root: string(knowledge.RootVendors),
+		IsDir: true, Size: size, SizeReady: true,
+	}
+}
+
+// Multi-select has to work on Vendors, not just System Data — deleting
+// several stale dependency directories in one pass is the point of the tab.
+func TestVendorsSupportMultiSelect(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.activeTab = tabVendors
+	f := &m.navs[tabVendors][0]
+	f.loading = false
+	for i, name := range []string{"alpha/node_modules", "beta/node_modules", "gamma/node_modules"} {
+		p := "/tmp/v" + string(rune('a'+i))
+		e := vendorEntry(name, p, int64(i+1)<<20)
+		m.pathDB[p] = knowledge.Entry{Score: knowledge.Caution, Description: "x", Effects: "y",
+			Commands: []string{"rm -rf " + p}}
+		f.entries = append(f.entries, e)
+	}
+	f.selected = f.entries[0].Path
+
+	for i := 0; i < 3; i++ {
+		m = pressKey(t, m, " ")
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(Model)
+	}
+
+	steps := m.orderedSteps()
+	if len(steps) != 3 {
+		t.Fatalf("queued %d vendor steps, want 3", len(steps))
+	}
+	for _, s := range steps {
+		if s.action != batchDelete {
+			t.Errorf("%s queued as %v, want batchDelete", s.name, s.action)
+		}
+	}
+	if total, complete := m.selectionTotal(); !complete || total != 6<<20 {
+		t.Errorf("total = %d (complete=%v), want %d", total, complete, int64(6)<<20)
+	}
+}
+
+// Leftovers have a tab of their own, so listing them in System Data too
+// only makes that list longer.
+func TestSystemDataHidesLeftovers(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+	next, _ := m.Update(entriesLoadedMsg{
+		frameID: m.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{
+			entry("com.google.Chrome", "/tmp/live", "Cache", knowledge.RootCaches, 1<<20),
+			entry("com.vanished.App", "/tmp/gone", "Cache", knowledge.RootCaches, 2<<20),
+		},
+	})
+	m = next.(Model)
+
+	for _, e := range m.currentEntries() {
+		if e.Name == "com.vanished.App" {
+			t.Error("a leftover is still listed under System Data")
+		}
+	}
+	// It is still in the underlying listing, and still on the Leftovers tab.
+	if len(m.navs[tabSystemData][0].entries) != 2 {
+		t.Error("filtering must hide rows, not drop them from the scan")
+	}
+	if len(m.navs[tabLeftovers][0].entries) != 1 {
+		t.Error("the leftover should appear on its own tab")
+	}
+}
+
+// Hundreds of 48 KB Apple extension containers bury the rows that matter.
+func TestSystemDataHidesTinyAppleFolders(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+	next, _ := m.Update(entriesLoadedMsg{
+		frameID: m.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{
+			entry("com.apple.quicklook.thumbnail.FontExtension", "/tmp/tiny", "Contain", knowledge.RootContainers, 48<<10),
+			entry("com.apple.AMPArtworkAgent", "/tmp/big", "Contain", knowledge.RootContainers, 500<<20),
+			entry("SomeVendor.tool", "/tmp/small-third-party", "Cache", knowledge.RootCaches, 4<<10),
+		},
+	})
+	m = next.(Model)
+
+	var names []string
+	for _, e := range m.currentEntries() {
+		names = append(names, e.Name)
+	}
+	if slicesContains(names, "com.apple.quicklook.thumbnail.FontExtension") {
+		t.Error("a sub-100KB Apple folder is still listed")
+	}
+	if !slicesContains(names, "com.apple.AMPArtworkAgent") {
+		t.Error("a large Apple folder must still be listed")
+	}
+	// The rule is deliberately Apple-only: a small third-party folder may
+	// be the leftover the user is hunting for.
+	if !slicesContains(names, "SomeVendor.tool") {
+		t.Error("the size rule must not apply to non-Apple folders")
+	}
+}
+
+func slicesContains(hay []string, needle string) bool {
+	for _, h := range hay {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// The only-selected filter turns a scattered selection into a reviewable
+// list without disturbing what is selected.
+func TestOnlySelectedFilter(t *testing.T) {
+	m := sysDataWith(t,
+		entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 3<<30),
+		entry("node-gyp", "/tmp/gyp", "Cache", knowledge.RootCaches, 1<<30),
+		entry("gopls", "/tmp/gopls", "Cache", knowledge.RootCaches, 2<<30),
+	)
+	m = pressKey(t, m, " ") // tick the first row
+
+	m = pressKey(t, m, "f")
+	if !m.onlySelected {
+		t.Fatal("f should turn the filter on")
+	}
+	if got := len(m.currentEntries()); got != 1 {
+		t.Errorf("filtered listing shows %d rows, want 1", got)
+	}
+	if len(m.selOrder) != 1 {
+		t.Error("filtering must not change the selection")
+	}
+
+	m = pressKey(t, m, "f")
+	if m.onlySelected {
+		t.Error("f should toggle back off")
+	}
+	if got := len(m.currentEntries()); got != 3 {
+		t.Errorf("unfiltered listing shows %d rows, want 3", got)
+	}
+}
+
+// g/G exist because compact Mac keyboards have no Home/End keys.
+func TestTopAndBottomJumps(t *testing.T) {
+	m := sysDataWith(t,
+		entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 3<<30),
+		entry("node-gyp", "/tmp/gyp", "Cache", knowledge.RootCaches, 2<<30),
+		entry("gopls", "/tmp/gopls", "Cache", knowledge.RootCaches, 1<<30),
+	)
+	m = pressKey(t, m, "G")
+	if got := m.selectedIndex(); got != 2 {
+		t.Errorf("after G, index = %d, want the last row (2)", got)
+	}
+	m = pressKey(t, m, "g")
+	if got := m.selectedIndex(); got != 0 {
+		t.Errorf("after g, index = %d, want the first row (0)", got)
+	}
+}
+
+// Reset returns to the composite order regardless of what was clicked,
+// rather than toggling the current column's direction.
+func TestSortResetReturnsToDefault(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	m = m.clickSort(sortByName)
+	m = m.clickSort(sortByName) // toggle to descending
+	if m.sortCol != sortByName {
+		t.Fatal("test setup: expected the name column to be active")
+	}
+	m = pressKey(t, m, "s")
+	if m.sortCol != sortDefault || m.sortAsc {
+		t.Errorf("after reset: col=%v asc=%v, want sortDefault descending", m.sortCol, m.sortAsc)
+	}
+}
+
+// The wheel scrolls the description, which is the whole point on a
+// keyboard with no PgUp/PgDn.
+func TestWheelScrollsDetailPanel(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	y := m.detailToolbarY() + 2
+
+	next, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress, Y: y})
+	m = next.(Model)
+	if m.detailScroll == 0 {
+		t.Error("wheel down over the detail panel should scroll it")
+	}
+	next, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress, Y: y})
+	m = next.(Model)
+	if m.detailScroll != 0 {
+		t.Errorf("detailScroll = %d, want back to 0", m.detailScroll)
+	}
+}
+
+// Clicking the ▲/▼ controls must hit the same rows the renderer drew.
+func TestDetailScrollButtonsAreClickable(t *testing.T) {
+	m := sysDataWith(t, entry("go-build", "/tmp/gb", "Cache", knowledge.RootCaches, 1<<30))
+	regions := m.detailScrollRegions()
+	if len(regions) != 2 {
+		t.Fatalf("got %d scroll regions, want 2", len(regions))
+	}
+	down := regions[1]
+	next, _ := m.Update(tea.MouseMsg{
+		Button: tea.MouseButtonLeft, Action: tea.MouseActionPress,
+		X: down.x0, Y: m.detailToolbarY(),
+	})
+	m = next.(Model)
+	if m.detailScroll == 0 {
+		t.Error("clicking ▼ should scroll the detail panel")
+	}
+}

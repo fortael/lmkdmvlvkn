@@ -70,34 +70,61 @@ var appSupportDB = map[string]Entry{
 			"a JetBrains install lives under ~/Library/Caches/JetBrains and is cleanable from the Cache tab.",
 		Container: true,
 	},
+	// Claude's vm_bundles/ is the largest thing this file still offers to
+	// clean, so the reasoning behind the split is written down. Claude.app
+	// embeds a manifest of VM releases — each one a 40-hex sha with a
+	// compressed artifact per file and published binary deltas from the
+	// previous few releases — and records which release every extracted file
+	// came from in a sibling .<name>.origin marker. A missing file is rebuilt
+	// in a fixed order: promote a prefetched copy out of warm/, decompress the
+	// local <name>.zst, download a delta against that .zst, or download the
+	// full .zst. That order is exactly why rootfs.img is offered here and
+	// rootfs.img.zst is not — keeping the 1.2GB compressed copy is what makes
+	// dropping the 5.6GB live image cost either nothing or a few hundred MB.
+	// sessiondata.img is spared because it is the sandbox's own saved state,
+	// which is also what Claude's own delete-VM-bundle command chooses to keep.
 	"Claude": {
 		Score: Caution,
-		Description: "The Claude desktop app's profile, which is two very different things sharing one folder. " +
-			"Most of it is a standard Electron profile: Cache/ and Code Cache/ are Chromium's disk caches, " +
-			"while Local Storage/, Cookies/ and config.json hold your signed-in session and MCP server " +
-			"configuration. The rest is the local agent sandbox — vm_bundles/claudevm.bundle is a Linux " +
-			"microVM the app runs local-agent/Cowork sessions inside (a sparse rootfs.img that reports 10GB " +
-			"but occupies ~5.6GB on disk, a compressed rootfs.img.zst copy of the same image, a kernel and " +
-			"initrd, plus sessiondata.img holding what those sessions changed), and vm_bundles/warm/ is a " +
-			"pre-fetched compressed copy of the next VM image. claude-code/ and claude-code-vm/ are versioned " +
-			"copies of the Claude Code runtime the app ships with.",
-		Effects: "Quit Claude Desktop first. Only Chromium's disk caches and the pre-fetched warm VM image are " +
-			"removed — roughly 2GB on this machine. You stay signed in, your MCP server configuration in " +
-			"config.json survives, local-agent session history in local-agent-mode-sessions/ survives, and the " +
-			"live sandbox VM is deliberately left alone so local agent mode keeps working without a multi-GB " +
-			"re-download. Claude re-fetches the warm image the next time it provisions or upgrades the VM. If " +
-			"you also want the ~7GB claudevm.bundle back, quit Claude and delete it by hand: the app rebuilds " +
-			"it on next launch by re-downloading the image, at the cost of whatever state was saved inside " +
-			"sessiondata.img.",
+		Description: "The Claude desktop app's profile, and two unrelated things sharing one folder — 9.8GB " +
+			"of them on this machine. The Electron half is ordinary: Cache/ and Code Cache/ are Chromium's " +
+			"disk caches (about 950MB together), while Local Storage/, Cookies/, config.json and " +
+			"local-agent-mode-sessions/ hold your signed-in session, your MCP server configuration and the " +
+			"history of past local-agent runs. The other 8.2GB is vm_bundles/, the Linux microVM that local " +
+			"agent mode and Cowork execute inside. claudevm.bundle/rootfs.img is the live sandbox disk, " +
+			"created 10GB but sparse — which is why `ls -l` claims 10GB and `du` reports the 5.6GB it really " +
+			"occupies — and it only ever grows, because space freed inside the guest is not handed back to " +
+			"the host file; next to it, rootfs.img.zst is the 1.2GB compressed copy of that same image which " +
+			"Claude rebuilds it from, vmlinuz and initrd are the guest kernel and boot image (225MB, kept " +
+			"both compressed and unpacked), and sessiondata.img is the sandbox's own saved state. " +
+			"vm_bundles/warm/ is a pre-fetched 1.2GB compressed copy of the next VM release, and claude-code/ " +
+			"plus claude-code-vm/ are the Claude Code runtime for the Mac and for the sandbox (302MB and " +
+			"295MB), one directory per version, with superseded versions pruned by Claude itself.",
+		Effects: "Quit Claude Desktop first — a running sandbox holds rootfs.img open. Removes the Chromium " +
+			"caches, the pre-fetched warm image and the live sandbox disk: about 7.7GB of the 9.8GB here, " +
+			"nearly all of it rootfs.img. Nothing holding work goes with it, so you stay signed in, " +
+			"config.json keeps your MCP servers, and sessiondata.img, local-agent-mode-sessions/, Local " +
+			"Storage/, Cookies/ and IndexedDB/ are deliberately left alone — as is the 1.2GB rootfs.img.zst, " +
+			"and sparing that one is the point, because Claude rebuilds rootfs.img by decompressing it " +
+			"locally: no download at all when it matches the VM release Claude currently wants, and a ~340MB " +
+			"delta download when it is one release behind. (Delete rootfs.img.zst by hand as well if you want " +
+			"that 1.2GB too, and the next VM release costs a full ~1.2GB download instead.) What you do give " +
+			"up is the sandbox's installed state: the next local-agent or Cowork run boots the factory image " +
+			"again and reinstalls whatever a session had added inside the VM, while your project files, which " +
+			"live on the Mac rather than in the image, are untouched. Claude ships the same action itself as " +
+			"\"Delete Cowork VM Bundle and Restart…\", which also keeps sessiondata.img; its \"Free Up Cowork " +
+			"Disk Space…\" command is a different thing that only tidies up inside the running guest and does " +
+			"not shrink rootfs.img on this side.",
 		Commands: []string{
-			`# Quit Claude Desktop first`,
+			`# Quit Claude Desktop first — a running sandbox holds rootfs.img open`,
 			`rm -rf ~/Library/Application\ Support/Claude/Cache/*`,
 			`rm -rf ~/Library/Application\ Support/Claude/Code\ Cache/*`,
 			`rm -rf ~/Library/Application\ Support/Claude/GPUCache/*`,
 			`rm -rf ~/Library/Application\ Support/Claude/DawnWebGPUCache/*`,
 			`rm -rf ~/Library/Application\ Support/Claude/DawnGraphiteCache/*`,
 			`rm -rf ~/Library/Application\ Support/Claude/vm_bundles/warm/*`,
-			`# vm_bundles/claudevm.bundle (the live sandbox VM) is deliberately not touched`,
+			`rm -f ~/Library/Application\ Support/Claude/vm_bundles/claudevm.bundle/rootfs.img`,
+			`# rootfs.img.zst is kept on purpose: it is what rebuilds rootfs.img without a download`,
+			`# sessiondata.img and local-agent-mode-sessions/ are never touched`,
 		},
 		CleanPaths: []string{
 			"Cache/*",
@@ -106,6 +133,7 @@ var appSupportDB = map[string]Entry{
 			"DawnWebGPUCache/*",
 			"DawnGraphiteCache/*",
 			"vm_bundles/warm/*",
+			"vm_bundles/claudevm.bundle/rootfs.img",
 		},
 	},
 	"Google": {

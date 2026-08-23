@@ -102,7 +102,17 @@ var homeItems = []HomeItem{
 					"from under it. The Ollama server has to be running — this is the one native command here that " +
 					"talks to a daemon rather than the filesystem, and it stops with Ollama's own error if it " +
 					"can't connect.",
-				Command: `ollama list | awk 'NR>1 {print $1}' | while IFS= read -r m; do [ -n "$m" ] && ollama rm "$m"; done`,
+				// Deliberately not one long pipeline. A shell pipeline's exit
+				// status is its *last* command's, so piping `ollama list`
+				// straight into the removal loop reports success even when
+				// the list failed outright — which is exactly what happened
+				// with the server stopped: nothing was removed and the app
+				// still said it worked. Capturing the list first makes the
+				// failure visible and stops before pretending to clean.
+				Command: `models=$(ollama list) || { echo 'Ollama server is not running — start Ollama, then try again'; exit 1; }; ` +
+					`names=$(echo "$models" | awk 'NR>1 {print $1}'); ` +
+					`[ -n "$names" ] || { echo 'No models installed'; exit 0; }; ` +
+					`for m in $names; do ollama rm "$m" || exit 1; done`,
 			},
 		},
 	},

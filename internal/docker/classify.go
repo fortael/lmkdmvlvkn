@@ -13,6 +13,28 @@ import (
 // compose lets a project override them.
 const composeProjectLabel = "com.docker.compose.project"
 
+// The rest of compose's labels answer "where did this come from" more
+// directly than anything else on a container. workingDirLabel in
+// particular is the directory on this machine that `docker compose up` was
+// run in, which is the fact a developer recognises instantly and which no
+// other Docker surface records.
+const (
+	composeServiceLabel     = "com.docker.compose.service"
+	composeWorkingDirLabel  = "com.docker.compose.project.working_dir"
+	composeConfigFilesLabel = "com.docker.compose.project.config_files"
+	composeVolumeLabel      = "com.docker.compose.volume"
+)
+
+// sourceDirLabels are labels other tools use to record the host directory a
+// container belongs to, for the containers compose did not create. VS
+// Code's dev containers and Docker Desktop's dev environments both stamp
+// the workspace folder on, and it is the same fact by another name.
+var sourceDirLabels = []string{
+	"devcontainer.local_folder",
+	"com.docker.devenvironments.code",
+	"com.docker.compose.project.working_dir",
+}
+
 // anonymousVolumeLabel is set by the daemon on a volume created because an
 // image declared a VOLUME the run did not map to a name.
 const anonymousVolumeLabel = "com.docker.volume.anonymous"
@@ -65,10 +87,29 @@ type containerFacts struct {
 	created  time.Time
 	lastUsed time.Time
 	project  string
+	service  string
 	labels   map[string]string
 	volumes  []string
+	mounts   []ContainerMount
+	info     *ContainerInfo
 	size     int64
 	sizeOK   bool
+}
+
+// ref renders this container as another object refers to it.
+func (c *containerFacts) ref() ContainerRef {
+	state := c.state
+	if state == "" {
+		state = "state unknown"
+	}
+	return ContainerRef{
+		ID:       c.id,
+		Name:     c.name,
+		State:    state,
+		Project:  c.project,
+		Service:  c.service,
+		LastUsed: c.lastUsed,
+	}
 }
 
 // imageFacts is one image, keyed by ID rather than by tag. Docker lists an
@@ -83,6 +124,13 @@ type imageFacts struct {
 	size     int64
 	sizeOK   bool
 	users    []*containerFacts
+	info     *ImageInfo
+	// apparent is the size including shared layers, as `docker images`
+	// prints it, as against size, which is only what removing it frees.
+	apparent int64
+	// layers is the image's RootFS layer list, kept for the base-image
+	// match below rather than for display.
+	layers []string
 }
 
 // volumeFacts is one volume plus everything that references it.
@@ -97,6 +145,7 @@ type volumeFacts struct {
 	size      int64
 	sizeOK    bool
 	users     []*containerFacts
+	info      *VolumeInfo
 }
 
 // classify turns a fetched snapshot into the classified item list. It is a
@@ -121,6 +170,7 @@ func classify(snap snapshot, now time.Time) ([]Item, error) {
 	// with the prose admitting which figures are missing.
 	inspects, inspectErr := decodeLines[containerInspect](snap.inspect)
 	volInspects, _ := decodeLines[volumeInspect](snap.volInspect)
+	imgInspects, _ := decodeLines[imageInspect](snap.imgInspect)
 	df, dfErr := parseDF(snap.df)
 	cav := caveats{
 		sizes:   dfErr == nil && !snap.sizesFailed,
@@ -128,8 +178,9 @@ func classify(snap snapshot, now time.Time) ([]Item, error) {
 	}
 
 	containers := buildContainers(psLines, inspects, df)
-	images := buildImages(imageLines, df, containers)
-	volumes := buildVolumes(volumeLines, volInspects, df, containers)
+	images := buildImages(imageLines, df, containers, imgInspects, snap.history)
+	linkBaseImages(images)
+	volumes := buildVolumes(volumeLines, volInspects, df, containers, images, snap.probes)
 
 	items := make([]Item, 0, len(containers)+len(images)+len(volumes)+1)
 	for _, c := range containers {
@@ -216,8 +267,18 @@ func buildContainers(lines []psLine, inspects []containerInspect, df systemDF) [
 		c.state = deriveState(l.State, in.State.Status, l.Status)
 		c.live = liveState(c.state) || (haveDetail && in.State.Running)
 		c.project = c.labels[composeProjectLabel]
+		c.service = c.labels[composeServiceLabel]
 		for _, m := range in.Mounts {
-			if strings.EqualFold(m.Type, "volume") && m.Name != "" {
+			mount := ContainerMount{
+				Type:        strings.ToLower(strings.TrimSpace(m.Type)),
+				Name:        m.Name,
+				Source:      m.Source,
+				Destination: m.Destination,
+				ReadOnly:    !m.RW,
+				Anonymous:   anonymousVolumeRe.MatchString(m.Name),
+			}
+			c.mounts = append(c.mounts, mount)
+			if mount.Type == "volume" && m.Name != "" {
 				c.volumes = append(c.volumes, m.Name)
 			}
 		}
@@ -226,9 +287,52 @@ func buildContainers(lines []psLine, inspects []containerInspect, df systemDF) [
 		} else if size, ok := parseSize(l.Size); ok {
 			c.size, c.sizeOK = size, true
 		}
+		if haveDetail {
+			c.info = containerInfo(c, l, in)
+		}
 		out = append(out, c)
 	}
 	return out
+}
+
+// containerInfo assembles the container's detail panel from the listing and
+// its inspect record.
+func containerInfo(c *containerFacts, l psLine, in containerInspect) *ContainerInfo {
+	info := &ContainerInfo{
+		Image:       c.imageRef,
+		ImageID:     c.imageID,
+		Command:     containerCommand(l, in),
+		WorkingDir:  in.Config.WorkingDir,
+		Ports:       strings.TrimSpace(l.Ports),
+		Networks:    strings.TrimSpace(l.Networks),
+		ExitCode:    in.State.ExitCode,
+		Project:     c.project,
+		Service:     c.service,
+		ProjectDir:  c.labels[composeWorkingDirLabel],
+		ConfigFiles: c.labels[composeConfigFilesLabel],
+		Labels:      c.labels,
+		Mounts:      c.mounts,
+		Env:         identifyingEnv(in.Config.Env),
+	}
+	for _, label := range sourceDirLabels {
+		if dir := c.labels[label]; dir != "" && dir != info.ProjectDir {
+			info.SourceDir = dir
+			break
+		}
+	}
+	return info
+}
+
+// containerCommand renders what actually runs as PID 1.
+//
+// inspect's Path/Args is the resolved truth — the entrypoint and command
+// already merged — while `docker ps` only prints a truncated rendering of
+// it. The listing is the fallback for when inspect gave nothing.
+func containerCommand(l psLine, in containerInspect) string {
+	if in.Path != "" {
+		return strings.TrimSpace(in.Path + " " + strings.Join(in.Args, " "))
+	}
+	return strings.Trim(strings.TrimSpace(l.Command), `"`)
 }
 
 // deriveState settles on a container state from the sources available.
@@ -290,7 +394,13 @@ func settledState(state string) bool {
 
 // buildImages groups the image listing by ID, attaches df's reclaimable
 // size, and joins containers to the image each was built from.
-func buildImages(lines []imageLine, df systemDF, containers []*containerFacts) []*imageFacts {
+func buildImages(
+	lines []imageLine,
+	df systemDF,
+	containers []*containerFacts,
+	inspects []imageInspect,
+	history map[string][]byte,
+) []*imageFacts {
 	// UniqueSize is the layers that exist only in this image, which is
 	// precisely what deleting it frees; Size counts shared layers too and
 	// so over-reports every image that has a common base. Summing
@@ -318,6 +428,10 @@ func buildImages(lines []imageLine, df systemDF, containers []*containerFacts) [
 			if size, ok := parseSize(dfSize[id]); ok {
 				img.size, img.sizeOK = size, true
 			}
+			// The listing's own Size column is the apparent size — the
+			// whole image, shared layers included — which is the figure
+			// `docker images` prints and the one a user recognises.
+			img.apparent, _ = parseSize(l.Size)
 			byID[id] = img
 			out = append(out, img)
 		}
@@ -359,12 +473,120 @@ func buildImages(lines []imageLine, df systemDF, containers []*containerFacts) [
 			img.users = append(img.users, c)
 		}
 	}
+
+	// Enrichment last, so a failed inspect costs the detail panel and
+	// nothing else: every image above is already listed, sized and joined.
+	for _, in := range inspects {
+		img := byID[shortID(in.ID)]
+		if img == nil {
+			continue
+		}
+		img.layers = in.RootFS.Layers
+		img.info = imageInfo(in, history[img.id])
+		img.info.ApparentSize = img.apparent
+	}
+	for _, img := range out {
+		if img.info == nil {
+			continue
+		}
+		for _, c := range img.users {
+			img.info.Users = append(img.info.Users, c.ref())
+		}
+	}
 	return out
 }
 
+// imageInfo assembles one image's detail panel from its inspect record and
+// its build history.
+func imageInfo(in imageInspect, historyOut []byte) *ImageInfo {
+	info := &ImageInfo{
+		Digest:          strings.TrimSpace(in.ID),
+		RepoDigests:     in.RepoDigests,
+		Architecture:    in.Architecture,
+		OS:              in.Os,
+		Labels:          in.Config.Labels,
+		Env:             identifyingEnv(in.Config.Env),
+		WorkingDir:      in.Config.WorkingDir,
+		Entrypoint:      in.Config.Entrypoint,
+		Cmd:             in.Config.Cmd,
+		User:            in.Config.User,
+		ExposedPorts:    sortedKeys(in.Config.ExposedPorts),
+		DeclaredVolumes: sortedKeys(in.Config.Volumes),
+		BuiltAt:         parseTime(in.Created),
+		PulledAt:        parseTime(in.Metadata.LastTagTime),
+		// The RootFS list is the authoritative layer count. Counting the
+		// non-empty history entries instead gets a slightly different
+		// answer, because a step can create a layer that happens to
+		// measure zero bytes, and the two figures side by side would look
+		// like an arithmetic mistake.
+		FilesystemLayers: len(in.RootFS.Layers),
+	}
+	if layers, err := parseHistory(historyOut); err == nil && len(layers) > 0 {
+		info.Layers = layers
+		info.MetadataSteps = metadataSteps(layers)
+		info.BaseSystem = baseSystem(layers)
+		info.PackageManager = packageManager(layers)
+	}
+	return info
+}
+
+// linkBaseImages works out which images on this machine were built on which
+// others, and records the relationship in both directions.
+//
+// It compares layer lists rather than parsing anything. An image built FROM
+// another one keeps that image's layers, in order, underneath its own, so
+// image A is a base of image B exactly when A's layer list is a proper
+// prefix of B's. That is not a heuristic — the layers are the same content
+// digests — and it is the only way to establish a base image, since Docker
+// keeps no record of the Dockerfile's FROM line.
+//
+// The longest matching prefix wins, so an image built on php:8.3-cli is
+// credited to php:8.3-cli rather than to the Debian image underneath it.
+func linkBaseImages(images []*imageFacts) {
+	named := make([]*imageFacts, 0, len(images))
+	for _, img := range images {
+		if len(img.layers) > 0 && len(img.refs) > 0 {
+			named = append(named, img)
+		}
+	}
+	for _, child := range images {
+		if child.info == nil || len(child.layers) == 0 {
+			continue
+		}
+		var best *imageFacts
+		for _, parent := range named {
+			if parent == child || len(parent.layers) >= len(child.layers) {
+				continue
+			}
+			if !slices.Equal(parent.layers, child.layers[:len(parent.layers)]) {
+				continue
+			}
+			if best == nil || len(parent.layers) > len(best.layers) {
+				best = parent
+			}
+		}
+		if best == nil {
+			continue
+		}
+		child.info.BaseImage = imageName(best)
+		if best.info != nil {
+			best.info.Derived = append(best.info.Derived, imageName(child))
+		}
+	}
+}
+
 // buildVolumes assembles the volume listing with df's size, inspect's
-// creation time, and the containers that reference each volume.
-func buildVolumes(lines []volumeLine, inspects []volumeInspect, df systemDF, containers []*containerFacts) []*volumeFacts {
+// creation time, the containers that reference each volume, and — the part
+// that matters — everything that can be recovered about where an anonymous
+// volume came from.
+func buildVolumes(
+	lines []volumeLine,
+	inspects []volumeInspect,
+	df systemDF,
+	containers []*containerFacts,
+	images []*imageFacts,
+	probes map[string]volumeProbe,
+) []*volumeFacts {
 	dfLine := make(map[string]volumeLine, len(df.Volumes))
 	for _, v := range df.Volumes {
 		dfLine[v.Name] = v
@@ -373,12 +595,25 @@ func buildVolumes(lines []volumeLine, inspects []volumeInspect, df systemDF, con
 	for _, in := range inspects {
 		detail[in.Name] = in
 	}
+	// The join that answers "which container created this volume" runs
+	// from the container side, not the volume side: a volume record holds
+	// no reference to anything, while every container lists the volumes it
+	// mounts and the path it mounts each one at.
 	users := make(map[string][]*containerFacts)
+	mountedAt := make(map[string]ContainerMount)
 	for _, c := range containers {
 		for _, name := range c.volumes {
 			users[name] = append(users[name], c)
 		}
+		for _, m := range c.mounts {
+			if m.Type == "volume" && m.Name != "" {
+				if _, seen := mountedAt[m.Name]; !seen {
+					mountedAt[m.Name] = m
+				}
+			}
+		}
 	}
+	declared, refs := imageVolumeIndex(images)
 
 	out := make([]*volumeFacts, 0, len(lines))
 	for _, l := range lines {
@@ -387,11 +622,22 @@ func buildVolumes(lines []volumeLine, inspects []volumeInspect, df systemDF, con
 			continue
 		}
 		v := &volumeFacts{name: name, labels: parseLabels(l.Labels), users: users[name]}
+		info := &VolumeInfo{
+			Driver:     strings.TrimSpace(l.Driver),
+			Mountpoint: strings.TrimSpace(l.Mountpoint),
+		}
 		if in, ok := detail[name]; ok {
 			v.created = parseTime(in.CreatedAt)
 			if len(in.Labels) > 0 {
 				v.labels = in.Labels
 			}
+			if in.Driver != "" {
+				info.Driver = in.Driver
+			}
+			if in.Mountpoint != "" {
+				info.Mountpoint = in.Mountpoint
+			}
+			info.Options = in.Options
 		}
 		if d, ok := dfLine[name]; ok {
 			if size, ok := parseSize(d.Size); ok {
@@ -404,9 +650,100 @@ func buildVolumes(lines []volumeLine, inspects []volumeInspect, df systemDF, con
 		// created by daemons old enough to predate the label.
 		_, labelled := v.labels[anonymousVolumeLabel]
 		v.anonymous = labelled || anonymousVolumeRe.MatchString(name)
+
+		info.Labels = v.labels
+		info.ComposeProject = v.project
+		info.ComposeService = v.labels[composeServiceLabel]
+		info.ComposeVolume = v.labels[composeVolumeLabel]
+		info.Contents = describeContents(probes[name])
+		info.HostPath = info.Contents.Path
+		mountedBy := ""
+		for _, c := range v.users {
+			ref := c.ref()
+			if m, ok := mountFor(c, name); ok {
+				ref.Destination = m.Destination
+				ref.ReadOnly = m.ReadOnly
+			}
+			if mountedBy == "" {
+				mountedBy = c.imageRef
+			}
+			info.Users = append(info.Users, ref)
+		}
+		resolveVolumeOrigin(info, mountedAt[name], mountedBy, declared, refs)
+		v.info = info
 		out = append(out, v)
 	}
 	return out
+}
+
+// mountFor finds how one container mounts one volume.
+func mountFor(c *containerFacts, volume string) (ContainerMount, bool) {
+	for _, m := range c.mounts {
+		if m.Type == "volume" && m.Name == volume {
+			return m, true
+		}
+	}
+	return ContainerMount{}, false
+}
+
+// imageVolumeIndex maps every VOLUME declared by an image still on this
+// machine to the images that declare it, and returns the full list of image
+// references alongside.
+func imageVolumeIndex(images []*imageFacts) (map[string][]string, []string) {
+	declared := make(map[string][]string)
+	var refs []string
+	for _, img := range images {
+		name := imageName(img)
+		refs = append(refs, name)
+		if img.info == nil {
+			continue
+		}
+		for _, path := range img.info.DeclaredVolumes {
+			declared[path] = append(declared[path], name)
+		}
+	}
+	return declared, refs
+}
+
+// resolveVolumeOrigin establishes where a volume was mounted and what
+// declared it, in descending order of how much the answer can be trusted.
+//
+// This is the hard case the package exists for. An anonymous volume is
+// created because some image declared a VOLUME and the run did not map it
+// to a name — but Docker records no link from the volume back to either the
+// image or the container, and once that container is removed there is
+// nothing left to join on. So:
+//
+//  1. A container that still exists is proof, and reports the exact path.
+//  2. Compose's own labels name the project and the volume's key.
+//  3. Otherwise the contents are the only witness left, and what they say
+//     is labelled as inference rather than as record — the conventional
+//     mount path of the software that wrote them, and any image still here
+//     from the same family.
+func resolveVolumeOrigin(info *VolumeInfo, mount ContainerMount, mountedBy string, declared map[string][]string, refs []string) {
+	if mount.Destination != "" {
+		info.Destination = mount.Destination
+		info.DestinationSource = "container"
+		info.DeclaringImages = declared[mount.Destination]
+		// With a recorded path and image, what is in there can be named
+		// even on an installation where the volume cannot be read at all.
+		inferContents(&info.Contents, mount.Destination, mountedBy)
+		return
+	}
+	if path := info.Contents.ConventionalPath; path != "" {
+		info.Destination = path
+		info.DestinationSource = "contents"
+		// An image declaring a VOLUME at exactly that path is evidence; an
+		// image whose *name* merely belongs to the same software family is
+		// a guess, and the two are kept in separate fields so the panel
+		// never presents the second as the first.
+		if named := declared[path]; len(named) > 0 {
+			info.DeclaringImages = named
+			info.DestinationSource = "image"
+			return
+		}
+		info.RelatedImages = contentsImages(info.Contents, refs)
+	}
 }
 
 // containerItem rates one container and writes its prose.
@@ -422,6 +759,7 @@ func containerItem(c *containerFacts, now time.Time, cav caveats) Item {
 		Anonymous: isGeneratedName(c.name) && c.project == "",
 		Project:   c.project,
 		Status:    c.status,
+		Container: c.info,
 	}
 	// Old CLIs and partial output can leave the status column empty; a
 	// blank cell reads as a bug, so fall back to the bare state.
@@ -519,6 +857,7 @@ func imageItem(img *imageFacts, cav caveats) Item {
 		Anonymous: img.dangling,
 		RefCount:  len(img.users),
 		Shared:    len(img.users) > 1,
+		Image:     img.info,
 	}
 	for _, c := range img.users {
 		item.LastUsed = newest(item.LastUsed, c.lastUsed)
@@ -629,6 +968,7 @@ func volumeItem(v *volumeFacts, cav caveats) Item {
 		Anonymous: v.anonymous,
 		Project:   v.project,
 		Status:    volumeStatus(v, referenced),
+		Volume:    v.info,
 	}
 	for _, c := range v.users {
 		item.LastUsed = newest(item.LastUsed, c.lastUsed)
@@ -646,10 +986,11 @@ func volumeItem(v *volumeFacts, cav caveats) Item {
 
 	case v.anonymous:
 		item.Verdict = VerdictDisposable
-		item.Description = "An anonymous volume: the daemon created it because an image declared a VOLUME the " +
-			"run never mapped to a name, and gave it a 64-character random name because nobody chose one. One " +
-			"of these is left behind by every `docker run` of an image like that which is not cleaned up " +
-			"afterwards, which is why they pile up. No container on this machine references it any more."
+		item.Description = contentsClause(v) + "An anonymous volume: the daemon created it because an image " +
+			"declared a VOLUME the run never mapped to a name, and gave it a 64-character random name because " +
+			"nobody chose one. One of these is left behind by every `docker run` of an image like that which " +
+			"is not cleaned up afterwards, which is why they pile up. No container on this machine references " +
+			"it any more."
 		item.Effects = "Deletes the volume's contents outright, and there is no re-pull that brings them back " +
 			"— unlike an image, a volume holds data rather than a copy of something a registry still has. In " +
 			"practice what is in one of these is whatever a since-deleted container wrote: a scratch database " +
@@ -660,14 +1001,15 @@ func volumeItem(v *volumeFacts, cav caveats) Item {
 	default:
 		item.Verdict = VerdictReview
 		if v.project != "" {
-			item.Description = "A named volume belonging to the `" + v.project + "` compose project. This is " +
+			item.Description = contentsClause(v) + "A named volume belonging to the `" + v.project + "` compose project. This is " +
 				"where that project keeps the data it intends to survive `docker compose down` — a database's " +
 				"data directory is the usual case. Its containers are not around at the moment, which is the " +
 				"normal state of a project that is simply not running."
 		} else {
-			item.Description = "A volume somebody named deliberately (" + v.name + "). Nothing references it " +
-				"right now, but a deliberate name means it was created to hold something worth keeping, and " +
-				"an unreferenced named volume is the normal state of a project between runs."
+			item.Description = contentsClause(v) + "A volume somebody named deliberately (" + v.name + "). " +
+				"Nothing references it right now, but a deliberate name means it was created to hold " +
+				"something worth keeping, and an unreferenced named volume is the normal state of a project " +
+				"between runs."
 		}
 		item.Effects = "Deletes the data. There is nothing to re-download: whatever this volume holds — " +
 			"database contents, uploaded files, generated state — is gone, and the next `docker compose up` " +
@@ -685,6 +1027,48 @@ func volumeItem(v *volumeFacts, cav caveats) Item {
 	}
 	item.Description += cav.note()
 	return item
+}
+
+// contentsClause opens a volume's description with what is actually in it,
+// when that could be established.
+//
+// It goes first on purpose. Everything else this package can say about an
+// anonymous volume — that it is anonymous, that nothing references it, how
+// big it is — is true of two dozen volumes at once and settles nothing.
+// "A MySQL 8 data directory holding the databases `clip-plus-service` and
+// `clip-plus-service-test`" settles it in one sentence.
+func contentsClause(v *volumeFacts) string {
+	if v.info == nil {
+		return ""
+	}
+	c := v.info.Contents
+	switch {
+	case c.Empty:
+		return "This volume is empty. "
+	case c.Software == "":
+		return ""
+	}
+	clause := "Judging by what is inside it, this is " + article(c.Software) + c.Software
+	for _, fact := range c.Facts {
+		if fact.Label == "Databases" {
+			clause += ", holding " + fact.Value
+			break
+		}
+	}
+	return clause + ". "
+}
+
+// article picks "a" or "an" for a phrase this package assembled, so the
+// prose does not read like a template. It only ever sees the software names
+// above, which are ordinary English words.
+func article(phrase string) string {
+	if phrase == "" {
+		return ""
+	}
+	if strings.ContainsRune("aeiouAEIOU", rune(phrase[0])) {
+		return "an "
+	}
+	return "a "
 }
 
 // buildCacheItem folds every BuildKit cache record into a single row.
@@ -725,13 +1109,14 @@ func buildCacheItem(records []buildCacheLine) (Item, bool) {
 	}
 
 	item := Item{
-		Kind:     KindBuildCache,
-		Name:     "Build cache",
-		Size:     reclaimable,
-		Created:  created,
-		LastUsed: lastUsed,
-		InUse:    inUse > 0,
-		Status:   fmt.Sprintf("%d records, %d in use", len(records), inUse),
+		Kind:       KindBuildCache,
+		Name:       "Build cache",
+		Size:       reclaimable,
+		Created:    created,
+		LastUsed:   lastUsed,
+		InUse:      inUse > 0,
+		Status:     fmt.Sprintf("%d records, %d in use", len(records), inUse),
+		BuildCache: buildCacheInfo(records, total, reclaimable, inUse),
 		Description: "BuildKit's build cache: the intermediate layers, downloaded build contexts and cache " +
 			"mounts kept from previous `docker build` runs so that a rebuild can skip every step whose inputs " +
 			"have not changed. It is " + countPhrase(len(records), "record") + " totalling " +
@@ -756,6 +1141,92 @@ func buildCacheItem(records []buildCacheLine) (Item, bool) {
 			"than an estimate."
 	}
 	return item, true
+}
+
+// pulledPrefix is how BuildKit describes a record holding an image it
+// downloaded during a build.
+const pulledPrefix = "pulled from "
+
+// execFragment is what BuildKit puts before the command a cached record is
+// the result of, in either "mount / from exec <cmd>" or "cached mount
+// /var/cache/apt from exec <cmd>".
+const execFragment = "from exec "
+
+// localSourcePrefix marks a record holding a copy of a build context or
+// Dockerfile taken from a directory on this machine.
+const localSourcePrefix = "local source for"
+
+// buildCacheInfo mines the cache records for the builds that produced them.
+//
+// This is the only place on the machine that can name a project whose
+// image, containers and volumes have all been deleted: BuildKit records
+// every reference it pulled and every command it ran, so a private registry
+// path in this list is proof that project was built here, months after
+// everything else about it is gone.
+func buildCacheInfo(records []buildCacheLine, total, reclaimable int64, inUse int) *BuildCacheInfo {
+	info := &BuildCacheInfo{
+		Records:     len(records),
+		InUse:       inUse,
+		Total:       total,
+		Reclaimable: reclaimable,
+	}
+	for _, r := range records {
+		size, _ := parseSize(r.Size)
+		desc := strings.TrimSpace(r.Description)
+		usage, _ := parseCount(r.UsageCount)
+		shown := desc
+
+		switch {
+		case strings.HasPrefix(desc, pulledPrefix):
+			// The digest is what makes two pulls of the same tag look like
+			// two different things; the reference is what a human knows.
+			ref, _, _ := strings.Cut(strings.TrimPrefix(desc, pulledPrefix), "@")
+			if ref = strings.TrimSpace(ref); ref != "" {
+				shown = pulledPrefix + ref
+				if !slices.Contains(info.Pulled, ref) {
+					info.Pulled = append(info.Pulled, ref)
+				}
+			}
+		case strings.HasPrefix(desc, localSourcePrefix):
+			info.LocalContexts++
+		default:
+			if prefix, cmd, ok := strings.Cut(desc, execFragment); ok {
+				cmd, _ = cleanHistoryCommand(strings.TrimSpace(cmd))
+				if cmd != "" {
+					shown = strings.TrimSpace(prefix) + " " + cmd
+					if !slices.Contains(info.Steps, cmd) {
+						info.Steps = append(info.Steps, cmd)
+					}
+				}
+			}
+		}
+
+		info.Biggest = append(info.Biggest, BuildCacheRecord{
+			Type:        strings.TrimSpace(r.CacheType),
+			Description: shown,
+			Size:        size,
+			InUse:       parseBool(r.InUse),
+			Shared:      parseBool(r.Shared),
+			UsageCount:  usage,
+			LastUsed:    parseTime(r.LastUsedAt),
+		})
+	}
+	slices.Sort(info.Pulled)
+	slices.Sort(info.Steps)
+	slices.SortStableFunc(info.Biggest, func(a, b BuildCacheRecord) int {
+		switch {
+		case a.Size > b.Size:
+			return -1
+		case a.Size < b.Size:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if len(info.Biggest) > 8 {
+		info.Biggest = info.Biggest[:8]
+	}
+	return info
 }
 
 // sizesUnavailableNote is appended wherever `docker system df` did not
@@ -812,14 +1283,34 @@ func imageStatus(img *imageFacts, projects []string) string {
 }
 
 // volumeStatus is the short status line for a volume.
+//
+// What is inside it beats every other fact here, and by a distance. The
+// user's complaint about this tab was that a row reading "Anonymous,
+// unused — 275.6 MB" is a black box; "Anonymous — MySQL 8 data directory"
+// is the same row answering the question.
 func volumeStatus(v *volumeFacts, referenced bool) string {
-	if referenced {
-		return "In use by " + countPhrase(max(len(v.users), v.links), "container")
+	var status string
+	switch {
+	case referenced:
+		status = "In use by " + countPhrase(max(len(v.users), v.links), "container")
+	case v.anonymous:
+		status = "Anonymous"
+	default:
+		status = "Unused"
 	}
-	if v.anonymous {
-		return "Anonymous, unused"
+	if v.info == nil {
+		return status
 	}
-	return "Unused"
+	switch {
+	case v.info.Contents.Software != "":
+		return status + " — " + v.info.Contents.Software
+	case v.info.Contents.Empty:
+		return status + " — empty"
+	case !referenced && v.anonymous:
+		return status + ", unused"
+	default:
+		return status
+	}
 }
 
 // distinctProjects lists the compose projects the given containers belong

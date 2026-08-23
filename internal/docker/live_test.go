@@ -87,6 +87,57 @@ func TestLiveScan(t *testing.T) {
 	}
 }
 
+// TestLiveDetails prints the detail panel for every object on the machine
+// and times the scan.
+//
+// It is a reading exercise as much as a test: the assertions only catch a
+// panel that cannot say anything at all, because whether a detail is
+// *useful* is a judgement no assertion makes. Run it after changing
+// anything in details.go, content.go or history.go and read the output.
+func TestLiveDetails(t *testing.T) {
+	skipUnlessLive(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	items, err := Scan(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	t.Logf("scanned %d object(s) in %s", len(items), elapsed.Round(time.Millisecond))
+	// The UI allows 90 seconds; a scan anywhere near that on a normal
+	// machine means the enrichment has stopped being affordable.
+	if elapsed > 30*time.Second {
+		t.Errorf("scan took %s, which is too close to the UI's 90s budget", elapsed)
+	}
+
+	for _, it := range items {
+		sections := it.Details()
+		if len(sections) == 0 {
+			t.Errorf("%s %q has no details at all", it.Kind, it.Name)
+			continue
+		}
+		t.Logf("\n=== %s %s (%s, %s)", it.Kind, it.Name, it.Verdict, humanSize(it.Size))
+		for _, s := range sections {
+			if s.Title == "" {
+				t.Errorf("%s %q has an untitled section", it.Kind, it.Name)
+			}
+			if len(s.Rows) == 0 && len(s.Lines) == 0 {
+				t.Errorf("%s %q section %q is empty", it.Kind, it.Name, s.Title)
+			}
+			t.Logf("  %s", s.Title)
+			for _, r := range s.Rows {
+				t.Logf("    %-24s %s", r.Label, r.Value)
+			}
+			for _, l := range s.Lines {
+				t.Logf("    %s", l)
+			}
+		}
+	}
+}
+
 // TestLiveAvailable checks the daemon probe against whatever is installed.
 func TestLiveAvailable(t *testing.T) {
 	skipUnlessLive(t)

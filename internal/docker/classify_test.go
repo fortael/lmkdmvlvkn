@@ -95,19 +95,11 @@ func TestSharedImageIsKeptAndSaysWhoElseNeedsIt(t *testing.T) {
 		// Only the first container is inspected; the second has to be
 		// joined to the image by its reference.
 		inspect: jsonLines(t, containerInspect{
-			ID:    "c1",
-			Name:  "/api-db-1",
-			Image: fullImageID("aaaaaaaaaaaa"),
-			State: struct {
-				Status     string
-				Running    bool
-				StartedAt  string
-				FinishedAt string
-			}{Status: "exited", StartedAt: ago(30 * 24 * time.Hour), FinishedAt: ago(21 * 24 * time.Hour)},
-			Config: struct {
-				Image  string
-				Labels map[string]string
-			}{Image: "postgres:16", Labels: map[string]string{composeProjectLabel: "api"}},
+			ID:     "c1",
+			Name:   "/api-db-1",
+			Image:  fullImageID("aaaaaaaaaaaa"),
+			State:  containerState{Status: "exited", StartedAt: ago(30 * 24 * time.Hour), FinishedAt: ago(21 * 24 * time.Hour)},
+			Config: containerConfig{Image: "postgres:16", Labels: map[string]string{composeProjectLabel: "api"}},
 		}),
 		images:  jsonLines(t, imageLine{ID: "aaaaaaaaaaaa", Repository: "postgres", Tag: "16"}),
 		volumes: nil,
@@ -439,12 +431,7 @@ func TestReferencedVolumeIsNeverOffered(t *testing.T) {
 			if tt.mounted {
 				snap.inspect = jsonLines(t, containerInspect{
 					ID: "c1", Name: "/api-db-1", Image: fullImageID("aaaaaaaaaaaa"),
-					Mounts: []struct {
-						Type        string
-						Name        string
-						Source      string
-						Destination string
-					}{{Type: "volume", Name: "api_db_data", Destination: "/var/lib/postgresql/data"}},
+					Mounts: []containerMount{{Type: "volume", Name: "api_db_data", Destination: "/var/lib/postgresql/data"}},
 				})
 			}
 
@@ -496,12 +483,7 @@ func TestRunningContainerIsNeverDisposable(t *testing.T) {
 				inspect: jsonLines(t, containerInspect{
 					ID: "c1", Name: "/nostalgic_ptolemy", Image: fullImageID("cccccccccccc"),
 					Created: ago(90 * 24 * time.Hour),
-					State: struct {
-						Status     string
-						Running    bool
-						StartedAt  string
-						FinishedAt string
-					}{Status: tt.state, Running: tt.state == "running",
+					State: containerState{Status: tt.state, Running: tt.state == "running",
 						StartedAt: ago(90 * 24 * time.Hour), FinishedAt: ago(60 * 24 * time.Hour)},
 				}),
 			}
@@ -533,12 +515,7 @@ func TestImageBackingARunningContainerIsInUse(t *testing.T) {
 		ps: jsonLines(t, psLine{ID: "c1", Names: "web", Image: "nginx:1.27", State: "running", Status: "Up 2 hours"}),
 		inspect: jsonLines(t, containerInspect{
 			ID: "c1", Name: "/web", Image: fullImageID("dddddddddddd"),
-			State: struct {
-				Status     string
-				Running    bool
-				StartedAt  string
-				FinishedAt string
-			}{Status: "running", Running: true, StartedAt: ago(2 * time.Hour)},
+			State: containerState{Status: "running", Running: true, StartedAt: ago(2 * time.Hour)},
 		}),
 		images: jsonLines(t, imageLine{ID: "dddddddddddd", Repository: "nginx", Tag: "1.27"}),
 		df:     dfJSON(t, systemDF{Images: []imageLine{{ID: fullImageID("dddddddddddd"), UniqueSize: "60MB"}}}),
@@ -603,12 +580,7 @@ func TestLastUsedPicksTheNewestTimestamp(t *testing.T) {
 					State: "exited", Status: "Exited (0) 3 weeks ago"}),
 				inspect: jsonLines(t, containerInspect{
 					ID: "c1", Name: "/sample", Created: tt.created,
-					State: struct {
-						Status     string
-						Running    bool
-						StartedAt  string
-						FinishedAt string
-					}{Status: "exited", StartedAt: tt.started, FinishedAt: tt.finished},
+					State: containerState{Status: "exited", StartedAt: tt.started, FinishedAt: tt.finished},
 				}),
 			}
 			c := find(t, mustClassify(t, snap), KindContainer, "sample")
@@ -663,16 +635,8 @@ func TestGeneratedNameContainerNeedsAgeToBeDisposable(t *testing.T) {
 			if tt.haveInspect {
 				snap.inspect = jsonLines(t, containerInspect{
 					ID: "c1", Name: "/" + tt.container, Created: ago(tt.idle + time.Hour),
-					State: struct {
-						Status     string
-						Running    bool
-						StartedAt  string
-						FinishedAt string
-					}{Status: "exited", StartedAt: ago(tt.idle + time.Hour), FinishedAt: ago(tt.idle)},
-					Config: struct {
-						Image  string
-						Labels map[string]string
-					}{Image: "busybox:latest", Labels: parseLabels(tt.labels)},
+					State:  containerState{Status: "exited", StartedAt: ago(tt.idle + time.Hour), FinishedAt: ago(tt.idle)},
+					Config: containerConfig{Image: "busybox:latest", Labels: parseLabels(tt.labels)},
 				})
 			}
 			c := find(t, mustClassify(t, snap), KindContainer, tt.container)
@@ -954,40 +918,14 @@ func richSnapshot(t *testing.T) snapshot {
 	t.Helper()
 	const anonVol = "0b6dd16c827320fab207c126a1104c3ee27cbe003c749d59cc76a47835729353"
 
-	mounts := func(name string) []struct {
-		Type        string
-		Name        string
-		Source      string
-		Destination string
-	} {
-		return []struct {
-			Type        string
-			Name        string
-			Source      string
-			Destination string
-		}{{Type: "volume", Name: name, Destination: "/data"}}
+	mounts := func(name string) []containerMount {
+		return []containerMount{{Type: "volume", Name: name, Destination: "/data"}}
 	}
-	state := func(status string, running bool, started, finished string) struct {
-		Status     string
-		Running    bool
-		StartedAt  string
-		FinishedAt string
-	} {
-		return struct {
-			Status     string
-			Running    bool
-			StartedAt  string
-			FinishedAt string
-		}{Status: status, Running: running, StartedAt: started, FinishedAt: finished}
+	state := func(status string, running bool, started, finished string) containerState {
+		return containerState{Status: status, Running: running, StartedAt: started, FinishedAt: finished}
 	}
-	config := func(image string, labels map[string]string) struct {
-		Image  string
-		Labels map[string]string
-	} {
-		return struct {
-			Image  string
-			Labels map[string]string
-		}{Image: image, Labels: labels}
+	config := func(image string, labels map[string]string) containerConfig {
+		return containerConfig{Image: image, Labels: labels}
 	}
 
 	return snapshot{

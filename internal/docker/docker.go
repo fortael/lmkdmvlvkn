@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -161,6 +162,20 @@ type Item struct {
 	// in use, because Docker would refuse, or because we could not
 	// classify it.
 	RemoveCmd string
+
+	// The four fields below carry everything the detail panel shows, and
+	// exactly one of them is set per item — whichever matches Kind. They
+	// are pointers so that "Docker would not tell us" is distinguishable
+	// from "Docker said nothing was there": a nil Image means the inspect
+	// failed, and the panel says so instead of drawing an empty table.
+	//
+	// Read them through Details rather than directly unless you want to
+	// lay the facts out yourself; Details is where the ordering and the
+	// wording live.
+	Image      *ImageInfo
+	Volume     *VolumeInfo
+	Container  *ContainerInfo
+	BuildCache *BuildCacheInfo
 }
 
 // CanRemove reports whether the UI should offer a remove action for the
@@ -273,7 +288,7 @@ func daemonReason(msg string) string {
 // parsing and classification stay pure functions the tests can drive with
 // recorded output.
 //
-// The three listings are required; inspect and df are enrichment. A scan
+// The three listings are required; everything else is enrichment. A scan
 // that loses df still lists every object, just without trustworthy sizes,
 // which is far more useful than refusing to show anything — and the flags
 // below let the prose admit which numbers are missing instead of
@@ -285,7 +300,17 @@ type snapshot struct {
 
 	inspect    []byte
 	volInspect []byte
+	imgInspect []byte
 	df         []byte
+
+	// history is `docker history --no-trunc` per image, keyed by short ID.
+	// It cannot be batched: the subcommand takes exactly one image.
+	history map[string][]byte
+
+	// probes is a shallow read of each volume's contents, keyed by volume
+	// name. It is the only part of a scan that touches the filesystem
+	// rather than the daemon.
+	probes map[string]volumeProbe
 
 	sizesFailed   bool
 	detailsFailed bool
@@ -296,6 +321,23 @@ type snapshot struct {
 // machine with thousands of stale containers is exactly the machine this
 // app is for, so the call is chunked rather than assumed to fit.
 const inspectBatch = 100
+
+// fetchWorkers bounds how many docker subprocesses run at once.
+//
+// The detail this package now shows costs one `docker history` per image,
+// and a machine with a hundred images would spend most of a scan waiting
+// for processes to start if they ran one at a time. Six is enough to hide
+// the per-process latency without turning a scan into a fork bomb on the
+// four-core laptops this app is aimed at.
+const fetchWorkers = 6
+
+// historyLimit caps how many images get their build history fetched.
+//
+// Images are sorted biggest-first before this is applied, so the cap only
+// ever costs the detail panel of images too small to be worth cleaning. A
+// machine with several hundred images would otherwise spend the whole scan
+// budget on histories nobody will open.
+const historyLimit = 60
 
 // Scan queries Docker and returns every object worth showing, already
 // classified. It runs only read-only subcommands, and ctx bounds all of
@@ -309,39 +351,126 @@ func Scan(ctx context.Context) ([]Item, error) {
 }
 
 // fetch runs the read-only docker commands one scan needs.
+//
+// It is deliberately two phases rather than one straight line. The three
+// listings and `system df` depend on nothing, so they run together; the
+// inspects and histories depend on the IDs those listings produce, so they
+// run together afterwards. On a machine with a dozen images that turns
+// twenty sequential subprocesses into two rounds of parallel ones.
 func fetch(ctx context.Context) (snapshot, error) {
 	bin, err := dockerPath()
 	if err != nil {
 		return snapshot{}, errors.New("the docker command is not installed, or is not on this app's PATH")
 	}
 
-	var snap snapshot
-	if snap.ps, err = run(ctx, bin, "ps", "-a", "--format", "{{json .}}"); err != nil {
-		return snapshot{}, err
-	}
-	if snap.images, err = run(ctx, bin, "images", "--format", "{{json .}}"); err != nil {
-		return snapshot{}, err
-	}
-	if snap.volumes, err = run(ctx, bin, "volume", "ls", "--format", "{{json .}}"); err != nil {
-		return snapshot{}, err
+	// Each task below writes only its own field and its own error, which
+	// is what makes running them together safe without a lock.
+	var (
+		snap                        snapshot
+		psErr, imagesErr, volumeErr error
+	)
+	runParallel(fetchWorkers, []func(){
+		func() { snap.ps, psErr = run(ctx, bin, "ps", "-a", "--format", "{{json .}}") },
+		func() { snap.images, imagesErr = run(ctx, bin, "images", "--format", "{{json .}}") },
+		func() { snap.volumes, volumeErr = run(ctx, bin, "volume", "ls", "--format", "{{json .}}") },
+		func() {
+			out, dfErr := run(ctx, bin, "system", "df", "-v", "--format", "{{json .}}")
+			if dfErr != nil {
+				snap.df, snap.sizesFailed = nil, true
+				return
+			}
+			snap.df = out
+		},
+	})
+	// The listings are the scan; without one of them there is nothing
+	// truthful to show, so their failure is fatal where df's is not.
+	for _, err := range []error{psErr, imagesErr, volumeErr} {
+		if err != nil {
+			return snapshot{}, err
+		}
 	}
 
 	// From here on a failure degrades the result instead of failing the
-	// scan. Sizes and timestamps are worth a lot, but not worth showing
-	// the user nothing at all when the listings themselves succeeded.
-	if ids := idsFrom(snap.ps); len(ids) > 0 {
-		out, inspectErr := runBatched(ctx, bin, []string{"inspect", "--type", "container", "--format", "{{json .}}"}, ids)
-		snap.inspect, snap.detailsFailed = out, inspectErr != nil
+	// scan. Sizes, timestamps and provenance are worth a lot, but not
+	// worth showing the user nothing at all when the listings succeeded.
+	var (
+		containerIDs = idsFrom(snap.ps)
+		volumeNames  = namesFrom(snap.volumes)
+		imageIDs     = imageIDsFrom(snap.images)
+		mountpoints  = mountpointsFrom(snap.volumes)
+		tasks        []func()
+		historyMu    sync.Mutex
+		probeMu      sync.Mutex
+	)
+	snap.history = make(map[string][]byte, len(imageIDs))
+	snap.probes = make(map[string]volumeProbe, len(volumeNames))
+
+	if len(containerIDs) > 0 {
+		tasks = append(tasks, func() {
+			out, inspectErr := runBatched(ctx, bin,
+				[]string{"inspect", "--type", "container", "--format", "{{json .}}"}, containerIDs)
+			snap.inspect, snap.detailsFailed = out, inspectErr != nil
+		})
 	}
-	if names := namesFrom(snap.volumes); len(names) > 0 {
-		// A missing volume inspect costs only creation timestamps, which
-		// nothing is classified on, so its failure is not even recorded.
-		snap.volInspect, _ = runBatched(ctx, bin, []string{"volume", "inspect", "--format", "{{json .}}"}, names)
+	if len(volumeNames) > 0 {
+		tasks = append(tasks, func() {
+			// A missing volume inspect costs only creation timestamps,
+			// which nothing is classified on, so its failure is not even
+			// recorded.
+			snap.volInspect, _ = runBatched(ctx, bin, []string{"volume", "inspect", "--format", "{{json .}}"}, volumeNames)
+		})
 	}
-	if snap.df, err = run(ctx, bin, "system", "df", "-v", "--format", "{{json .}}"); err != nil {
-		snap.df, snap.sizesFailed = nil, true
+	if len(imageIDs) > 0 {
+		tasks = append(tasks, func() {
+			snap.imgInspect, _ = runBatched(ctx, bin, []string{"image", "inspect", "--format", "{{json .}}"}, imageIDs)
+		})
+		for _, id := range imageIDs[:min(len(imageIDs), historyLimit)] {
+			tasks = append(tasks, func() {
+				out, historyErr := run(ctx, bin, "history", "--no-trunc", "--format", "{{json .}}", id)
+				if historyErr != nil {
+					return
+				}
+				historyMu.Lock()
+				snap.history[id] = out
+				historyMu.Unlock()
+			})
+		}
 	}
+	for _, name := range volumeNames {
+		tasks = append(tasks, func() {
+			probe := probeVolume(ctx, mountpoints[name], name)
+			probeMu.Lock()
+			snap.probes[name] = probe
+			probeMu.Unlock()
+		})
+	}
+	runParallel(fetchWorkers, tasks)
 	return snap, nil
+}
+
+// runParallel runs every task with at most limit of them in flight, and
+// returns once they have all finished. Each task writes only its own part
+// of the snapshot, so there is nothing to synchronise beyond the wait —
+// except the two maps, which their tasks lock for themselves.
+func runParallel(limit int, tasks []func()) {
+	if len(tasks) == 0 {
+		return
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for _, task := range tasks {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			task()
+		}()
+	}
+	wg.Wait()
 }
 
 // runBatched runs one command over args in chunks, concatenating stdout.
@@ -397,4 +526,69 @@ func namesFrom(volOut []byte) []string {
 		}
 	}
 	return names
+}
+
+// mountpointsFrom maps each volume name to the mountpoint the listing
+// reports, so the contents probe does not have to wait for `docker volume
+// inspect` to finish before it can start.
+func mountpointsFrom(volOut []byte) map[string]string {
+	lines, err := decodeLines[volumeLine](volOut)
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]string, len(lines))
+	for _, l := range lines {
+		if n := strings.TrimSpace(l.Name); n != "" {
+			out[n] = strings.TrimSpace(l.Mountpoint)
+		}
+	}
+	return out
+}
+
+// imageIDsFrom pulls the distinct image IDs out of already-fetched `docker
+// images` output, biggest first.
+//
+// The order matters because historyLimit truncates this list: an image is
+// worth a subprocess in proportion to how much space it takes, so if
+// anything has to be left without a build history it should be the 6 MB
+// one rather than the 1.3 GB one. Distinctness matters because Docker
+// prints an image once per tag it carries, and fetching the same history
+// three times would be three subprocesses wasted.
+func imageIDsFrom(imagesOut []byte) []string {
+	lines, err := decodeLines[imageLine](imagesOut)
+	if err != nil {
+		return nil
+	}
+	type sized struct {
+		id   string
+		size int64
+	}
+	var (
+		out  []sized
+		seen = make(map[string]bool, len(lines))
+	)
+	for _, l := range lines {
+		id := shortID(l.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		size, _ := parseSize(l.Size)
+		out = append(out, sized{id: id, size: size})
+	}
+	slices.SortStableFunc(out, func(a, b sized) int {
+		switch {
+		case a.size > b.size:
+			return -1
+		case a.size < b.size:
+			return 1
+		default:
+			return 0
+		}
+	})
+	ids := make([]string, 0, len(out))
+	for _, s := range out {
+		ids = append(ids, s.id)
+	}
+	return ids
 }

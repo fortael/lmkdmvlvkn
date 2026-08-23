@@ -72,18 +72,23 @@ func Append(r Record) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	line, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(append(line, '\n'))
-	return err
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	// Close is reported rather than deferred and dropped: on a write it is
+	// where a deferred flush surfaces, so ignoring it would mean claiming
+	// a record was logged when it never reached disk.
+	return f.Close()
 }
 
 // Load reads the whole log, newest first. A truncated or corrupt line —
@@ -101,7 +106,8 @@ func Load() ([]Record, error) {
 		}
 		return nil, err
 	}
-	defer f.Close()
+	// Read-only, so a failed close costs nothing the caller can act on.
+	defer func() { _ = f.Close() }()
 
 	var out []Record
 	sc := bufio.NewScanner(f)
