@@ -247,7 +247,7 @@ func HomeItems() []HomeItem {
 // (caches.go, appsupport.go, ...) so the curated prose stays browsable.
 var db = map[Root]map[string]Entry{
 	RootCaches:          mergeTables(cachesDB, ideCachesDB, appleCachesDB),
-	RootAppSupport:      mergeTables(appSupportDB, ideAppSupportDB, appleAppSupportDB),
+	RootAppSupport:      mergeTables(appSupportDB, ideAppSupportDB, appleAppSupportDB, chromeAppSupportDB),
 	RootGroupContainers: groupContainersDB,
 	RootLogs:            logsDB,
 	RootContainers:      mergeTables(containersDB, appleContainersDB),

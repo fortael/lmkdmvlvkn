@@ -40,7 +40,15 @@ func appDirs() []string {
 // bundleIDRe matches a reverse-DNS bundle identifier with at least three
 // components (com.hnc.Discord). Two-component names like "group.storekit"
 // are too generic to reason about and are skipped.
-var bundleIDRe = regexp.MustCompile(`^[A-Za-z0-9-]+(?:\.[A-Za-z0-9_-]+){2,}$`)
+//
+// The first component must start with a letter, which is what separates a
+// bundle identifier from a version number. Without that rule a Chrome
+// component directory named 2025.8.8.1141 parses as a perfectly good
+// identifier, matches no installed app, and gets reported as a leftover —
+// a 4 GB folder mislabelled as abandoned. Every real reverse-DNS
+// identifier starts with a TLD-like label (com, org, io, dev, ru, hf), so
+// requiring a leading letter costs nothing.
+var bundleIDRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9_-]+){2,}$`)
 
 // teamPrefixRe matches the 10-character Apple Developer Team ID that
 // prefixes group-container folder names, e.g. the "6N38VWS5BX." in

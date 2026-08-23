@@ -2,6 +2,7 @@ package ui
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,27 @@ func sized(t *testing.T, w, h int) Model {
 	m := New()
 	next, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
 	return next.(Model)
+}
+
+// libRoot is a real scanned Library root, so entries built on top of it
+// count as root-level — which leftover detection now requires, since only
+// a folder sitting directly inside a Library root can be something an
+// uninstalled app abandoned.
+func libRoot(t *testing.T, root knowledge.Root) string {
+	t.Helper()
+	for _, r := range knowledge.SystemDataRoots() {
+		if r.Root == root {
+			return r.Path
+		}
+	}
+	t.Fatalf("no scanned root for %s", root)
+	return ""
+}
+
+// rootEntry builds a measured row sitting directly inside a Library root.
+func rootEntry(t *testing.T, name, source string, root knowledge.Root, size int64) *scan.Entry {
+	t.Helper()
+	return entry(name, filepath.Join(libRoot(t, root), name), source, root, size)
 }
 
 // entry builds a measured table row for tests.
@@ -314,8 +336,8 @@ func TestUnknownRowCannotBeSelected(t *testing.T) {
 // Protected storage is excluded from every path, batch included.
 func TestProtectedRowCannotBeSelected(t *testing.T) {
 	home, _ := os.UserHomeDir()
-	orb := entry("HUAQ24HBR6.dev.orbstack",
-		home+"/Library/Group Containers/HUAQ24HBR6.dev.orbstack", "GroupC", knowledge.RootGroupContainers, 12<<30)
+	_ = home
+	orb := rootEntry(t, "HUAQ24HBR6.dev.orbstack", "GroupC", knowledge.RootGroupContainers, 12<<30)
 	m := sysDataWith(t, orb)
 	m = pressKey(t, m, " ")
 	if len(m.selOrder) != 0 {
@@ -441,8 +463,8 @@ func TestLeftoversTabCollectsOrphansOnly(t *testing.T) {
 	m := sized(t, 150, 45)
 	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
 
-	live := entry("com.google.Chrome", "/tmp/chrome", "Cache", knowledge.RootCaches, 1<<20)
-	gone := entry("com.vanished.EditorPro", "/tmp/gone", "Cache", knowledge.RootCaches, 5<<20)
+	live := rootEntry(t, "com.google.Chrome", "Cache", knowledge.RootCaches, 1<<20)
+	gone := rootEntry(t, "com.vanished.EditorPro", "Cache", knowledge.RootCaches, 5<<20)
 	next, _ := m.Update(entriesLoadedMsg{frameID: m.navs[tabSystemData][0].id, entries: []*scan.Entry{live, gone}})
 	m = next.(Model)
 
@@ -466,8 +488,8 @@ func TestLeftoversSelectAllQueuesDeletes(t *testing.T) {
 	next, _ := m.Update(entriesLoadedMsg{
 		frameID: m.navs[tabSystemData][0].id,
 		entries: []*scan.Entry{
-			entry("com.gone.One", "/tmp/one", "Cache", knowledge.RootCaches, 1<<20),
-			entry("com.gone.Two", "/tmp/two", "Cache", knowledge.RootCaches, 2<<20),
+			rootEntry(t, "com.gone.One", "Cache", knowledge.RootCaches, 1<<20),
+			rootEntry(t, "com.gone.Two", "Cache", knowledge.RootCaches, 2<<20),
 		},
 	})
 	m = next.(Model)
@@ -692,8 +714,8 @@ func TestSystemDataHidesLeftovers(t *testing.T) {
 	next, _ := m.Update(entriesLoadedMsg{
 		frameID: m.navs[tabSystemData][0].id,
 		entries: []*scan.Entry{
-			entry("com.google.Chrome", "/tmp/live", "Cache", knowledge.RootCaches, 1<<20),
-			entry("com.vanished.App", "/tmp/gone", "Cache", knowledge.RootCaches, 2<<20),
+			rootEntry(t, "com.google.Chrome", "Cache", knowledge.RootCaches, 1<<20),
+			rootEntry(t, "com.vanished.App", "Cache", knowledge.RootCaches, 2<<20),
 		},
 	})
 	m = next.(Model)
@@ -847,5 +869,49 @@ func TestDetailScrollButtonsAreClickable(t *testing.T) {
 	m = next.(Model)
 	if m.detailScroll == 0 {
 		t.Error("clicking ▼ should scroll the detail panel")
+	}
+}
+
+// A Chrome component directory is named after a version, which parses as
+// a plausible bundle identifier and matches no installed app. Flagging it
+// mislabelled a 4 GB folder as abandoned, and it could never show up on
+// the Leftovers tab either, since that is built from the root listing.
+func TestVersionedSubfolderIsNotALeftover(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+
+	nested := entry("2025.8.8.1141",
+		filepath.Join(libRoot(t, knowledge.RootAppSupport),
+			"Google", "Chrome", "OptGuideOnDeviceModel", "2025.8.8.1141"),
+		"AppSupp", knowledge.RootAppSupport, 4<<30)
+
+	if m.knowledgeIn([]*scan.Entry{nested}, nested).Orphan {
+		t.Error("a versioned subdirectory was flagged as a leftover")
+	}
+}
+
+// Anything flagged as a leftover must be reachable on the Leftovers tab,
+// or the flag is a dead end.
+func TestEverythingFlaggedAppearsOnLeftoversTab(t *testing.T) {
+	m := sized(t, 150, 45)
+	m.appIndex = knowledge.AppIndexForTest("com.google.Chrome")
+	next, _ := m.Update(entriesLoadedMsg{
+		frameID: m.navs[tabSystemData][0].id,
+		entries: []*scan.Entry{
+			rootEntry(t, "com.gone.Thing", "Cache", knowledge.RootCaches, 1<<20),
+			rootEntry(t, "com.google.Chrome", "Cache", knowledge.RootCaches, 1<<20),
+		},
+	})
+	m = next.(Model)
+
+	src := m.navs[tabSystemData][0]
+	onLeftovers := make(map[string]bool)
+	for _, e := range m.navs[tabLeftovers][0].entries {
+		onLeftovers[e.Path] = true
+	}
+	for _, e := range src.entries {
+		if m.knowledgeIn(src.entries, e).Orphan && !onLeftovers[e.Path] {
+			t.Errorf("%s is flagged as a leftover but is not on the Leftovers tab", e.Name)
+		}
 	}
 }

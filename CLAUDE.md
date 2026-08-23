@@ -43,6 +43,11 @@ directories, modeled after ../claude-keeper's architecture and style.
   gated on the matching manifest so a Go `vendor/` is never mistaken for
   a PHP one. `ModTime` is the *project's* last edit, not the dependency
   directory's, since that's what answers "am I still working here".
+- `internal/ollama` — reads Ollama's model store off disk so models can be
+  listed and removed **without the Ollama server running** (`ollama rm`
+  talks to a daemon that is usually stopped). Also finds orphaned blobs,
+  which `ollama rm` can never reach because it only removes what a
+  manifest names.
 - `internal/history` — append-only JSONL log of every deletion under
   `~/.maccleaner/`, backing the Results tab.
 - `internal/ui` — the only package that imports bubbletea/lipgloss.

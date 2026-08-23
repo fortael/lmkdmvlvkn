@@ -218,6 +218,10 @@ type Model struct {
 	// this has to be more useful than that or it has no reason to be here.
 	dockerItems map[string]docker.Item
 
+	// libraryRoots are the absolute paths of the scanned Library folders,
+	// resolved once so the per-row leftover check isn't recomputing them.
+	libraryRoots []string
+
 	// dockerReason explains why the Docker tab is empty when the daemon
 	// isn't reachable.
 	dockerReason string
@@ -286,6 +290,10 @@ func New() Model {
 		label: "Leftovers",
 		root:  knowledge.RootCaches,
 	}}
+
+	for _, r := range knowledge.SystemDataRoots() {
+		m.libraryRoots = append(m.libraryRoots, r.Path)
+	}
 
 	m.navs[tabSystemData] = []navFrame{{
 		id:      m.newFrameID(),
@@ -1242,8 +1250,27 @@ func (m Model) knowledgeIn(all []*scan.Entry, e *scan.Entry) knowledge.Entry {
 		}
 	}
 	k := knowledge.Effective(knowledge.Root(e.Root), e.Name, siblings)
-	k = knowledge.AnnotateOrphan(k, knowledge.Root(e.Root), e.Name, m.appIndex)
+	// Leftover detection only makes sense for a folder sitting directly
+	// inside a Library root: that is what an uninstalled app abandons.
+	// A nested subdirectory belongs to whatever contains it, and flagging
+	// one would also be unreachable — the Leftovers tab is built from the
+	// root listing, so a row flagged deeper down could never appear there.
+	if m.isLibraryRootChild(e) {
+		k = knowledge.AnnotateOrphan(k, knowledge.Root(e.Root), e.Name, m.appIndex)
+	}
 	return knowledge.Protect(k, e.Path)
+}
+
+// isLibraryRootChild reports whether e sits directly inside one of the
+// scanned Library roots, rather than deeper in a subtree.
+func (m Model) isLibraryRootChild(e *scan.Entry) bool {
+	parent := filepath.Dir(e.Path)
+	for _, r := range m.libraryRoots {
+		if parent == r {
+			return true
+		}
+	}
+	return false
 }
 
 // tabTotalSize sums the known sizes of a tab's landing listing, for the

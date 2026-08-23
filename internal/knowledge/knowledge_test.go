@@ -471,7 +471,8 @@ func TestNoDuplicateDictionaryKeys(t *testing.T) {
 		{"Caches", map[string]map[string]Entry{
 			"cachesDB": cachesDB, "ideCachesDB": ideCachesDB, "appleCachesDB": appleCachesDB}},
 		{"Application Support", map[string]map[string]Entry{
-			"appSupportDB": appSupportDB, "ideAppSupportDB": ideAppSupportDB, "appleAppSupportDB": appleAppSupportDB}},
+			"appSupportDB": appSupportDB, "ideAppSupportDB": ideAppSupportDB,
+			"appleAppSupportDB": appleAppSupportDB, "chromeAppSupportDB": chromeAppSupportDB}},
 		{"Containers", map[string]map[string]Entry{
 			"containersDB": containersDB, "appleContainersDB": appleContainersDB}},
 	}
@@ -510,6 +511,27 @@ func TestJetBrainsPatternCoversCommunityAndNewerProducts(t *testing.T) {
 	for _, name := range []string{"Goland", "Phpstorm", "JetBrains", "Toolbox", "GoLand", "GoLand2026"} {
 		if _, _, _, ok := parseJetBrainsVersion(name); ok {
 			t.Errorf("%s matched the versioned-folder pattern but is not one", name)
+		}
+	}
+}
+
+// A version-numbered directory is not a bundle identifier. Chrome names
+// its component directories after versions, and treating one as an
+// abandoned app's leftover mislabelled a 4 GB folder.
+func TestVersionNumbersAreNotBundleIDs(t *testing.T) {
+	ix := testIndex("com.google.Chrome")
+	for _, name := range []string{"2025.8.8.1141", "1.2.3.4", "128.0.6613.120", "2026.1.0"} {
+		if _, ok := normalizeBundleName(name); ok {
+			t.Errorf("%q was parsed as a bundle identifier", name)
+		}
+		if ix.Orphaned(name) {
+			t.Errorf("%q was reported as a leftover", name)
+		}
+	}
+	// Real identifiers still parse.
+	for _, name := range []string{"com.hnc.Discord", "ru.keepcoder.Telegram", "dev.warp.Warp-Stable"} {
+		if _, ok := normalizeBundleName(name); !ok {
+			t.Errorf("%q should still parse as a bundle identifier", name)
 		}
 	}
 }
